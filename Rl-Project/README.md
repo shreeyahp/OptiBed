@@ -1,46 +1,59 @@
-# OptiBed — Hospital Bed Allocation Simulator
+# OptiBed
 
-OptiBed is a hospital bed-allocation simulator for Normal and COVID wards. It combines a finite-state policy optimizer with a Streamlit dashboard for exploring demand, bed transfers, and patient discharges.
+OptiBed is a hospital bed-allocation simulation in which a tabular Q-learning agent learns how many waiting patients to treat at each step. The agent is trained on the environment, then runs a learned policy in the dashboard. Emergency and high-severity patients are prioritized when beds are allocated. The episode uses 8 beds, starts with 8 patients, and runs for 20 steps.
 
-## Quick start
-
-Open PowerShell in the project folder (currently `Rl-Project`) and run:
+## Run
 
 ```powershell
 python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
-Open the local URL printed by Streamlit, usually `http://localhost:8501`.
+The **Simulation** tab has **Start**, **Stop**, and **Reset** controls. Start automatically advances the episode at a slow pace (one step every 1.8 seconds); no manual allocation is required. The dashboard shows available beds as bed icons and waiting patients by severity. After every decision, it displays the observed state, chosen allocation, learned Q-value, reward breakdown, treated patients, next state, and new arrivals. The **Graphs** tab shows waiting patients by severity, beds in use versus available, and step/cumulative reward. Charts are kept out of the Simulation tab.
 
-To stop the dashboard, press `Ctrl+C` in the PowerShell window.
+The dashboard trains the agent once when the app starts (1,200 training episodes; subsequent page reruns reuse the trained agent). It uses epsilon-greedy exploration during training and the greedy learned policy during the displayed episode. Its compact state tracks available beds, waiting high/medium/low patient counts, emergency count, and steps remaining; each queue count is capped at 16 to keep the tabular state space bounded. The Q-learning update is:
 
-## Using the dashboard
+```text
+Q(s, a) <- Q(s, a) + alpha * (r + gamma * max_a' Q(s', a') - Q(s, a))
+```
 
-1. Set the total number of beds and how many start in the Normal ward. Remaining beds are assigned to COVID.
-2. Adjust each ward's average daily requests and discharges, the future-reward discount, simulation length, and random seed.
-3. Select **Apply settings & reset** to calculate a policy for the new configuration.
-4. Use **Start / resume** to run automatically, **Pause** to stop, **Step one day** to advance manually, or **Reset run** to restart.
-5. Adjust **Time per simulated day** to control the animation pace. The default is 0.8 seconds per day.
+This is a small educational tabular agent, not a clinical decision-support system.
 
-The dashboard displays ward occupancy, the policy's suggested transfer, expected reward, a policy heatmap, daily results, and an event log. A positive transfer means Normal → COVID; a negative transfer means COVID → Normal.
-
-## Model and reward
-
-The policy's state tracks each ward's bed capacity and currently available beds. Independent Poisson distributions model daily requests and discharges. Discharges are limited to the number of occupied beds.
-
-- Each unmet Normal request costs 10 reward points.
-- Each unmet COVID request costs 20 reward points.
-- Each transferred bed costs 5 reward points.
-
-The simulation uses the configured random seed, so the same settings and seed produce the same run. Total capacity is limited to 15 beds to keep policy optimization interactive.
-
-## Dependencies
-
-Dependencies are listed in `requirements.txt`: NumPy, SciPy, pandas, and Streamlit.
-
-Run the simulator tests with:
+Start the API separately if needed:
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m uvicorn api:app --reload
 ```
+
+API documentation: `http://127.0.0.1:8000/docs`.
+
+## Environment rules
+
+- Regular arrivals each step: Poisson(1.5). One emergency patient has an independent 20% chance to arrive each step.
+- Regular patient severity: low (50%), medium (30%), or high (20%). Emergency patients are high severity.
+- Waiting patients have a 20% chance per step of worsening by one level.
+- A treated patient occupies a bed for 1–3 steps.
+- The agent chooses an integer allocation from zero to the smaller of available beds and waiting patients. Emergency patients are selected first, then high/medium/low severity, then earlier arrivals. The HTTP API still exposes the environment directly for external agents that submit their own allocation.
+
+### Rewards
+
+| Event | Reward |
+|---|---:|
+| Treat low / medium / high severity | +1 / +2 / +3 |
+| Treat an emergency patient | +1 bonus |
+| Leave a high-severity patient untreated for a step | −2 |
+| Leave an emergency patient untreated for a step | −1.5 |
+| Leave an available bed unused while people are waiting | −0.3 per bed |
+| Patient deterioration | −0.5 per severity level |
+
+## API
+
+Run tests with `python -m unittest discover -s tests -v`.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/reset` | Start a new episode; optional `seed` query parameter. |
+| `POST` | `/step` | Submit `{"allocate": 2}` and receive observation, reward, and details. |
+| `GET` | `/state` | Current beds, waiting patients, and episode progress. |
+| `GET` | `/grade` | Normalized grade and cumulative reward. |
+| `GET` | `/health` | API health check. |

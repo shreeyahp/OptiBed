@@ -1,356 +1,350 @@
-"""OptiBed dashboard for the hospital bed-allocation simulator."""
+"""Automated, full-width OptiBed simulation and episode graphs."""
 
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from rl_model import HospitalSimulator, PolicySolver, SimulationConfig
+from rl_model import HospitalEnvironment, Observation, QLearningAgent
 
 
-st.set_page_config(
-    page_title="OptiBed | Hospital Bed Allocation",
-    page_icon="🏥",
-    layout="wide",
-)
+PLAYBACK_INTERVAL_SECONDS = 1.8
 
+st.set_page_config(page_title="OptiBed", layout="wide")
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 1.6rem; padding-bottom: 2rem;}
+    .block-container {max-width: 100%; padding: 1.4rem 2.2rem 2rem;}
     [data-testid="stMetric"] {
-        background: #f5f8fc;
-        border: 1px solid #e4eaf2;
-        padding: 0.9rem 1rem;
-        border-radius: 0.75rem;
+        background: #fff; border: 1px solid #dbe7f5; border-radius: 12px;
+        padding: 0.7rem 1rem; box-shadow: 0 2px 8px rgba(37, 99, 235, 0.04);
     }
-    .ward-card {
-        border: 1px solid #e4eaf2;
-        border-radius: 0.9rem;
-        padding: 1.1rem 1.25rem;
-        background: #ffffff;
+    .bed-grid {
+        display: grid; grid-template-columns: repeat(4, minmax(92px, 1fr));
+        gap: 12px; margin: 1rem 0;
     }
-    .subtle {color: #65758b; font-size: 0.9rem;}
+    .bed {
+        min-height: 94px; display: flex; flex-direction: column;
+        justify-content: center; align-items: center; gap: 5px;
+        border-radius: 11px; background: #eaf3ff; color: #1683f8;
+        font: 600 0.78rem sans-serif;
+    }
+    .bed.free {background: #f0f3f7; color: #9aa9b9;}
+    .bed svg {width: 50px; height: 42px;}
+    .patient-card {
+        min-height: 104px; border-radius: 11px; padding: 10px;
+        text-align: center; margin: 0 0 10px; border: 1px solid #e5eaf0;
+    }
+    .patient-card.high {background: #fff0f0; border-color: #ffd1d1;}
+    .patient-card.medium {background: #fff8e8; border-color: #ffe8af;}
+    .patient-card.low {background: #eafaf3; border-color: #c5f1dd;}
+    .patient-id {font-weight: 700; color: #24364b; margin-bottom: 8px;}
+    .severity {
+        display: inline-block; border-radius: 20px; padding: 3px 10px;
+        font-size: 0.78rem; font-weight: 700;
+    }
+    .high .severity {background: #ffd7d7; color: #b42318;}
+    .medium .severity {background: #ffebbd; color: #9a5b00;}
+    .low .severity {background: #c8f2dd; color: #087443;}
+    .emergency {margin-top: 7px; font-size: 0.75rem; color: #c62828; font-weight: 700;}
+    .regular {margin-top: 7px; font-size: 0.75rem; color: #62758a;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+BED_ICON = """
+<svg viewBox="0 0 64 48" aria-hidden="true">
+  <path d="M8 7v32M8 26h46a5 5 0 0 1 5 5v8M8 20h13a8 8 0 0 1 8 8v-2h25"
+        fill="none" stroke="currentColor" stroke-width="5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M14 39v5m39-5v5" fill="none" stroke="currentColor"
+        stroke-width="4" stroke-linecap="round"/>
+</svg>
+"""
+
+
+@st.cache_resource
+def get_trained_agent() -> QLearningAgent:
+    agent = QLearningAgent()
+    agent.train()
+    return agent
+
+
+with st.spinner("Training the Q-learning agent for this hospital environment..."):
+    agent = get_trained_agent()
+
+if "environment" not in st.session_state:
+    st.session_state.environment = HospitalEnvironment()
+if "simulation_running" not in st.session_state:
+    st.session_state.simulation_running = False
+if "last_step_time" not in st.session_state:
+    st.session_state.last_step_time = 0.0
+if "last_step" not in st.session_state:
+    st.session_state.last_step = None
+
 st.title("OptiBed")
 st.caption(
-    "Hospital bed allocation simulation: explore how transfers, patient arrivals, "
-    "and discharges affect two wards."
+    "Watch a Q-learning agent make automatic bed-allocation decisions in a "
+    "20-step hospital episode."
 )
+simulation_tab, graphs_tab = st.tabs(["Simulation", "Graphs"])
 
-if "config" not in st.session_state:
-    st.session_state.config = SimulationConfig()
-    st.session_state.solver = PolicySolver(st.session_state.config)
-    st.session_state.simulator = HospitalSimulator(st.session_state.config)
-    st.session_state.running = False
-    st.session_state.last_tick = time.monotonic()
 
-with st.sidebar:
-    st.header("Hospital setup")
-    with st.form("configuration"):
-        total_beds = st.number_input(
-            "Total hospital beds", min_value=2, max_value=15,
-            value=st.session_state.config.total_beds, step=1,
-        )
-        normal_beds = st.slider(
-            "Beds initially allocated to Normal",
-            min_value=0,
-            max_value=int(total_beds),
-            value=min(st.session_state.config.normal_beds, int(total_beds)),
-        )
-        st.caption(f"COVID ward starts with {int(total_beds) - normal_beds} beds.")
-
-        st.subheader("Daily patient flow")
-        normal_arrivals = st.number_input(
-            "Normal requests (Poisson mean)", 0.0, 10.0,
-            st.session_state.config.normal_arrivals, step=0.5,
-        )
-        covid_arrivals = st.number_input(
-            "COVID requests (Poisson mean)", 0.0, 10.0,
-            st.session_state.config.covid_arrivals, step=0.5,
-        )
-        normal_discharges = st.number_input(
-            "Normal discharges (Poisson mean)", 0.0, 10.0,
-            st.session_state.config.normal_discharges, step=0.5,
-        )
-        covid_discharges = st.number_input(
-            "COVID discharges (Poisson mean)", 0.0, 10.0,
-            st.session_state.config.covid_discharges, step=0.5,
-        )
-        discount_rate = st.slider(
-            "Future reward discount", min_value=0.1, max_value=0.99,
-            value=st.session_state.config.discount_rate, step=0.01,
-        )
-        simulation_days = st.number_input(
-            "Simulation duration (days)", min_value=1, max_value=100,
-            value=st.session_state.config.simulation_days, step=1,
-        )
-        seed = st.number_input(
-            "Random seed", min_value=0, max_value=999999,
-            value=st.session_state.config.seed, step=1,
-        )
-        apply_settings = st.form_submit_button(
-            "Apply settings & reset", type="primary", width="stretch"
-        )
-
-    step_delay = st.slider(
-        "Time per simulated day",
-        min_value=0.2,
-        max_value=2.0,
-        value=0.8,
-        step=0.1,
-        help="The slower setting makes arrivals and bed changes easier to follow.",
-    )
-
-    if apply_settings:
-        try:
-            new_config = SimulationConfig(
-                total_beds=int(total_beds),
-                normal_beds=int(normal_beds),
-                normal_arrivals=float(normal_arrivals),
-                covid_arrivals=float(covid_arrivals),
-                normal_discharges=float(normal_discharges),
-                covid_discharges=float(covid_discharges),
-                discount_rate=float(discount_rate),
-                simulation_days=int(simulation_days),
-                seed=int(seed),
+def render_patient_cards(waiting: list[dict[str, Any]]) -> None:
+    if not waiting:
+        st.success("Everyone in the waiting list has been treated.")
+        return
+    for start in range(0, len(waiting), 4):
+        patient_columns = st.columns(4)
+        for column, patient in zip(patient_columns, waiting[start : start + 4]):
+            severity = patient["severity"]
+            emergency_label = (
+                '<div class="emergency">Emergency</div>'
+                if patient["emergency"]
+                else '<div class="regular">Waiting</div>'
             )
-            new_config.validate()
-            with st.spinner("Optimizing the bed-transfer policy..."):
-                new_solver = PolicySolver(new_config)
-            st.session_state.config = new_config
-            st.session_state.solver = new_solver
-            st.session_state.simulator = HospitalSimulator(new_config)
-            st.session_state.running = False
-            st.session_state.last_tick = time.monotonic()
-            st.rerun()
-        except ValueError as error:
-            st.error(str(error))
-
-config: SimulationConfig = st.session_state.config
-solver: PolicySolver = st.session_state.solver
+            column.markdown(
+                f'<div class="patient-card {severity}">'
+                f'<div class="patient-id">Patient {patient["id"]}</div>'
+                f'<span class="severity">{severity.title()}</span>'
+                f"{emergency_label}</div>",
+                unsafe_allow_html=True,
+            )
 
 
-@st.fragment(run_every=0.2)
-def simulation_view() -> None:
-    sim: HospitalSimulator = st.session_state.simulator
-    policy_solver: PolicySolver = st.session_state.solver
-
-    if (
-        st.session_state.running
-        and not sim.finished
-        and time.monotonic() - st.session_state.last_tick >= step_delay
-    ):
-        sim.step(policy_solver)
-        st.session_state.last_tick = time.monotonic()
-        if sim.finished:
-            st.session_state.running = False
-
-    start_col, pause_col, step_col, reset_col = st.columns([1.1, 1.1, 1.0, 1.0])
-    with start_col:
-        if st.button(
-            "▶  Start / resume",
-            disabled=sim.finished,
-            type="primary",
-            width="stretch",
-            key="start_simulation",
-        ):
-            st.session_state.running = True
-            st.session_state.last_tick = time.monotonic()
-    with pause_col:
-        if st.button(
-            "Ⅱ  Pause",
-            disabled=not st.session_state.running,
-            width="stretch",
-            key="pause_simulation",
-        ):
-            st.session_state.running = False
-    with step_col:
-        if st.button(
-            "Step one day",
-            disabled=sim.finished,
-            width="stretch",
-            key="step_simulation",
-        ):
-            st.session_state.running = False
-            sim.step(policy_solver)
-            st.session_state.last_tick = time.monotonic()
-    with reset_col:
-        if st.button("Reset run", width="stretch", key="reset_simulation"):
-            st.session_state.running = False
-            st.session_state.simulator = HospitalSimulator(st.session_state.config)
-            st.session_state.last_tick = time.monotonic()
-            st.rerun()
-
-    st.progress(sim.day / config.simulation_days, text=f"Day {sim.day} of {config.simulation_days}")
-
-    normal_state = sim.state
-    recommendation = policy_solver.action_for(normal_state)
-    if recommendation > 0:
-        recommendation_text = f"Move {recommendation} free bed(s) from Normal to COVID"
-    elif recommendation < 0:
-        recommendation_text = f"Move {abs(recommendation)} free bed(s) from COVID to Normal"
-    else:
-        recommendation_text = "Keep the current bed allocation"
-    st.success(f"Policy recommendation: **{recommendation_text}**")
-
-    expected_before = policy_solver.expected_reward(normal_state)
-    _, next_state = next(
-        (action, next_state)
-        for action, next_state in policy_solver.actions(normal_state)
-        if action == recommendation
-    )
-    expected_after = (
-        policy_solver.expected_reward(next_state) - 5.0 * abs(recommendation)
-    )
-    score_before, score_after = st.columns(2)
-    score_before.metric("Expected daily reward · no transfer", f"{expected_before:.1f}")
-    score_after.metric("Expected daily reward · recommended", f"{expected_after:.1f}")
-
-    normal_col, covid_col = st.columns(2)
-    with normal_col:
-        st.markdown('<div class="ward-card">', unsafe_allow_html=True)
-        st.subheader("Normal ward")
-        available_col, occupied_col = st.columns(2)
-        available_col.metric("Available", f"{sim.normal_available} / {sim.normal_capacity}")
-        occupied_col.metric(
-            "Occupied", f"{sim.normal_capacity - sim.normal_available} / {sim.normal_capacity}"
+def render_transition(observation: Observation, transition: dict[str, Any]) -> None:
+    with st.container(border=True):
+        st.subheader(f"RL decision · step {observation['step']}")
+        before = transition["observation"]
+        after = transition["next_observation"]
+        st.write(
+            f"**State / observation** `sₜ` = "
+            f"`{agent.state_key(before)}` "
+            "(beds, high, medium, low, emergencies, steps remaining)"
         )
-        st.progress(
-            sim.normal_available / sim.normal_capacity
-            if sim.normal_capacity
-            else 0.0,
-            text="Free-bed capacity",
+        st.write(
+            f"**Action** `aₜ`: allocate **{transition['action']}** bed(s). "
+            f"**Policy value** `Q(sₜ, aₜ)`: "
+            f"**{transition['q_value']:+.2f}**"
         )
-        st.markdown("</div>", unsafe_allow_html=True)
-    with covid_col:
-        st.markdown('<div class="ward-card">', unsafe_allow_html=True)
-        st.subheader("COVID ward")
-        available_col, occupied_col = st.columns(2)
-        available_col.metric("Available", f"{sim.covid_available} / {sim.covid_capacity}")
-        occupied_col.metric(
-            "Occupied", f"{sim.covid_capacity - sim.covid_available} / {sim.covid_capacity}"
-        )
-        st.progress(
-            sim.covid_available / sim.covid_capacity
-            if sim.covid_capacity
-            else 0.0,
-            text="Free-bed capacity",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.subheader("Live simulation")
-    history = pd.DataFrame(sim.history)
-    chart_col, results_col = st.columns([1.7, 1.0])
-    with chart_col:
-        chart_data = history.set_index("day")[
-            ["normal_available", "covid_available", "normal_occupied", "covid_occupied"]
+        reward, reward_components = transition["reward"], transition["info"][
+            "reward_components"
         ]
-        st.line_chart(chart_data, height=300)
-        st.caption("Available and occupied beds by ward over the simulated days.")
-    with results_col:
-        st.metric("Normal unmet requests", sim.total_unmet_normal)
-        st.metric("COVID unmet requests", sim.total_unmet_covid)
-        st.metric("Bed transfers made", sim.total_moved)
-        st.metric("Cumulative reward", f"{sim.total_reward:.0f}")
+        st.write(f"**Reward** `rₜ`: **{reward:+.2f}**")
+        nonzero_rewards = {
+            name.replace("_", " ").title(): amount
+            for name, amount in reward_components.items()
+            if amount
+        }
+        if nonzero_rewards:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"Reward component": name, "Value": f"{amount:+.2f}"}
+                        for name, amount in nonzero_rewards.items()
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.caption("No reward or penalty was recorded for this step.")
 
-    recent = history.iloc[1:].tail(1)
-    if not recent.empty:
-        latest = recent.iloc[0]
-        st.info(
-            f"Latest day: **{int(latest['normal_unmet'])}** unmet Normal request(s), "
-            f"**{int(latest['covid_unmet'])}** unmet COVID request(s), "
-            f"reward **{latest['reward']:.0f}**."
+        treated = transition["info"]["treated_patients"]
+        if treated:
+            treated_summary = ", ".join(
+                f"#{patient['id']} {patient['severity']}"
+                + (" emergency" if patient["emergency"] else "")
+                for patient in treated
+            )
+            st.write(f"**Patients treated:** {treated_summary}")
+        else:
+            st.write("**Patients treated:** none")
+        st.write(
+            f"**Environment transition** `sₜ → sₜ₊₁`: "
+            f"`{agent.state_key(after)}`"
+        )
+        st.caption(
+            f"Next arrivals: {transition['info']['arrivals']} "
+            f"({transition['info']['emergency_arrivals']} emergency). "
+            "The learned Q-table was trained with the Bellman update "
+            "`Q(s,a) ← Q(s,a) + α[r + γ max Q(s′,a′) − Q(s,a)]`."
         )
 
-    st.subheader("Policy heatmap")
-    st.caption(
-        "Each cell shows the transfer recommendation for that free-bed state. "
-        "Positive values move beds Normal → COVID; negative values move COVID → Normal. "
-        "The current state is outlined."
-    )
-    allocation_normal = sim.normal_capacity
-    allocation_covid = sim.covid_capacity
-    values = []
-    row_labels = list(range(allocation_covid, -1, -1))
-    for covid_available in row_labels:
-        row = []
-        for normal_available in range(allocation_normal + 1):
-            cell_state = (allocation_normal, normal_available, covid_available)
-            row.append(
-                policy_solver.action_for(cell_state)
-                if cell_state in policy_solver.policy
-                else None
-            )
-        values.append(row)
-    heatmap = pd.DataFrame(
-        values,
-        index=[f"COVID {value}" for value in row_labels],
-        columns=[f"Normal {value}" for value in range(allocation_normal + 1)],
-    )
-    current_row = f"COVID {sim.covid_available}"
-    current_col = f"Normal {sim.normal_available}"
 
-    def highlight_current(data: pd.DataFrame) -> pd.DataFrame:
-        styles = pd.DataFrame("", index=data.index, columns=data.columns)
-        if current_row in styles.index and current_col in styles.columns:
-            styles.loc[current_row, current_col] = (
-                "outline: 3px solid #1e78d2; outline-offset: -3px; font-weight: bold"
-            )
-        return styles
-
-    st.dataframe(
-        heatmap.style
-        .background_gradient(cmap="RdYlGn", axis=None, vmin=-config.total_beds, vmax=config.total_beds)
-        .format("{:+.0f}", na_rep="—")
-        .apply(highlight_current, axis=None),
+@st.fragment(
+    run_every=0.2 if st.session_state.simulation_running else None
+)
+def render_simulation() -> None:
+    environment: HospitalEnvironment = st.session_state.environment
+    state = environment.state()
+    controls = st.columns([1, 1, 1, 3])
+    if controls[0].button(
+        "Start",
+        type="primary",
+        disabled=state["done"] or st.session_state.simulation_running,
         width="stretch",
-        height=min(440, 45 + 35 * len(heatmap.index)),
-    )
-    st.caption(
-        f"Policy optimization converged in {policy_solver.iterations} value-iteration passes. "
-        "The simulation uses a fixed random seed for repeatable comparisons."
-    )
-
-    st.subheader("Daily event log")
-    if len(history) > 1:
-        event_columns = [
-            "day",
-            "requests_normal",
-            "requests_covid",
-            "admissions_normal",
-            "admissions_covid",
-            "discharged_normal",
-            "discharged_covid",
-            "normal_unmet",
-            "covid_unmet",
-            "action",
-            "reward",
-        ]
-        event_log = history.iloc[1:][event_columns].rename(
-            columns={
-                "day": "Day",
-                "requests_normal": "Normal requests",
-                "requests_covid": "COVID requests",
-                "admissions_normal": "Normal admitted",
-                "admissions_covid": "COVID admitted",
-                "discharged_normal": "Normal discharged",
-                "discharged_covid": "COVID discharged",
-                "normal_unmet": "Normal unmet",
-                "covid_unmet": "COVID unmet",
-                "action": "Transfer (+ Normal → COVID)",
-                "reward": "Reward",
-            }
-        )
-        st.dataframe(event_log.iloc[::-1], width="stretch", hide_index=True)
+        key="start_simulation",
+    ):
+        st.session_state.simulation_running = True
+        st.session_state.last_step_time = time.monotonic()
+        st.rerun(scope="app")
+    if controls[1].button(
+        "Stop",
+        disabled=not st.session_state.simulation_running,
+        width="stretch",
+        key="stop_simulation",
+    ):
+        st.session_state.simulation_running = False
+        st.rerun(scope="app")
+    if controls[2].button(
+        "Reset",
+        width="stretch",
+        key="reset_simulation",
+    ):
+        st.session_state.environment = HospitalEnvironment()
+        st.session_state.simulation_running = False
+        st.session_state.last_step_time = 0.0
+        st.session_state.last_step = None
+        st.rerun(scope="app")
+    if state["done"]:
+        controls[3].caption("Status: episode complete")
+    elif st.session_state.simulation_running:
+        controls[3].caption("Status: running automatically")
     else:
-        st.caption("Start or step the simulation to see the arrivals and discharges here.")
+        controls[3].caption("Status: paused")
+
+    if st.session_state.simulation_running and not state["done"]:
+        now = time.monotonic()
+        if now - st.session_state.last_step_time >= PLAYBACK_INTERVAL_SECONDS:
+            action = agent.choose_action(state)
+            q_value = agent.q_value(state, action)
+            next_state, reward, done, info = environment.step(action)
+            st.session_state.last_step = {
+                "observation": state,
+                "action": action,
+                "q_value": q_value,
+                "next_observation": next_state,
+                "reward": reward,
+                "info": info,
+            }
+            st.session_state.last_step_time = now
+            if done:
+                st.session_state.simulation_running = False
+                st.rerun(scope="app")
+            state = next_state
+
+    waiting = state["patients"]
+    occupied = len(environment.occupied)
+    beds_total = environment.config.beds
+    metrics = st.columns(4)
+    metrics[0].metric("Beds available", f"{state['beds']} / {beds_total}")
+    metrics[1].metric("Patients waiting", len(waiting))
+    metrics[2].metric("Total reward", f"{environment.total_reward:+.1f}")
+    metrics[3].metric("Episode grade", f"{environment.grade():.3f}")
+    st.progress(
+        state["step"] / state["max_steps"],
+        text=f"Episode progress · step {state['step']} of {state['max_steps']}",
+    )
+
+    hospital_column, queue_column = st.columns([1, 2.4], gap="large")
+    with hospital_column:
+        with st.container(border=True):
+            st.subheader("Hospital beds")
+            st.caption(
+                f"{occupied} of {beds_total} beds are in use. "
+                f"{state['beds']} are ready for patients."
+            )
+            bed_slots = []
+            for bed_number in range(beds_total):
+                in_use = bed_number < occupied
+                style = "bed" if in_use else "bed free"
+                label = "In use" if in_use else "Available"
+                bed_slots.append(
+                    f'<div class="{style}">{BED_ICON}<span>'
+                    f"Bed {bed_number + 1:02d} · {label}</span></div>"
+                )
+            st.markdown(
+                f'<div class="bed-grid">{"".join(bed_slots)}</div>',
+                unsafe_allow_html=True,
+            )
+        with st.container(border=True):
+            st.subheader("Agent")
+            st.write("**Algorithm:** tabular Q-learning")
+            st.write(f"**Training episodes:** {agent.training_episodes:,}")
+            st.write(f"**Learned states:** {len(agent.q_table):,}")
+            recent_return = sum(agent.episode_returns[-100:]) / min(
+                100, len(agent.episode_returns)
+            )
+            st.write(f"**Mean return (last 100 training episodes):** {recent_return:+.1f}")
+            st.write(f"**Playback:** one decision every {PLAYBACK_INTERVAL_SECONDS:.1f}s")
+            st.caption(
+                "The agent was trained before playback. Start runs its learned "
+                "policy; Stop pauses it; Reset starts a fresh episode."
+            )
+
+    with queue_column:
+        with st.container(border=True):
+            st.subheader(f"Patients waiting · {len(waiting)}")
+            st.caption("Emergency patients and severity are identified on each card.")
+            render_patient_cards(waiting)
+        if st.session_state.last_step is not None:
+            render_transition(state, st.session_state.last_step)
+        elif state["step"] == 0:
+            st.info("Press Start to watch the trained agent make its first decision.")
+        if state["done"]:
+            st.success("Episode complete. Press Reset to run another episode.")
 
 
-simulation_view()
+@st.fragment(
+    run_every=1.0 if st.session_state.simulation_running else None
+)
+def render_graphs() -> None:
+    environment: HospitalEnvironment = st.session_state.environment
+    if environment.step_number == 0:
+        st.info("Graphs will appear here after the first simulation step.")
+        return
+
+    history = pd.DataFrame(environment.history).set_index("step")
+    queue_column, bed_column = st.columns(2, gap="large")
+    with queue_column:
+        with st.container(border=True):
+            st.subheader("Who is waiting?")
+            st.caption("Waiting patients at each severity level after every step.")
+            queue_trend = history[
+                ["waiting_high", "waiting_medium", "waiting_low"]
+            ].rename(
+                columns={
+                    "waiting_high": "High severity",
+                    "waiting_medium": "Medium severity",
+                    "waiting_low": "Low severity",
+                }
+            )
+            st.line_chart(queue_trend, color=["#ef5350", "#f5b82e", "#24b47e"])
+    with bed_column:
+        with st.container(border=True):
+            st.subheader("Bed use")
+            st.caption("Beds in use compared with available beds.")
+            st.line_chart(
+                history[["occupied_beds", "available_beds"]],
+                color=["#3388ee", "#9aa9b9"],
+            )
+    with st.container(border=True):
+        st.subheader("Reward over time")
+        st.caption("Step reward is each decision's score; episode total accumulates it.")
+        reward_trend = history[["reward", "cumulative_reward"]].rename(
+            columns={"reward": "This step", "cumulative_reward": "Episode total"}
+        )
+        st.line_chart(reward_trend, color=["#f5a623", "#17a673"])
+        st.metric("Current episode grade", f"{environment.grade():.3f}")
+
+
+with simulation_tab:
+    render_simulation()
+
+with graphs_tab:
+    render_graphs()

@@ -1,352 +1,395 @@
-"""Bed-allocation Markov decision process and stochastic hospital simulation."""
+"""Gym-style hospital bed allocation environment."""
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import TypeAlias
+from numbers import Integral
+from typing import Literal, TypedDict
 
 import numpy as np
-from scipy.stats import poisson
 
-
-State: TypeAlias = tuple[int, int, int]
+Severity = Literal["low", "medium", "high"]
+SEVERITY_LEVEL: dict[Severity, int] = {"low": 0, "medium": 1, "high": 2}
 
 
 @dataclass(frozen=True)
-class SimulationConfig:
-    total_beds: int = 10
-    normal_beds: int = 5
-    normal_arrivals: float = 2.0
-    covid_arrivals: float = 2.0
-    normal_discharges: float = 1.0
-    covid_discharges: float = 1.0
-    discount_rate: float = 0.8
-    simulation_days: int = 30
-    seed: int = 7
-
-    @property
-    def covid_beds(self) -> int:
-        return self.total_beds - self.normal_beds
-
-    def validate(self) -> None:
-        if not 2 <= self.total_beds <= 15:
-            raise ValueError("Total beds must be between 2 and 15.")
-        if not 0 <= self.normal_beds <= self.total_beds:
-            raise ValueError("Normal beds must be between zero and total beds.")
-        rates = (
-            self.normal_arrivals,
-            self.covid_arrivals,
-            self.normal_discharges,
-            self.covid_discharges,
-        )
-        if any(rate < 0 or rate > 10 for rate in rates):
-            raise ValueError("Arrival and discharge rates must be between 0 and 10.")
-        if not 0 < self.discount_rate < 1:
-            raise ValueError("Discount rate must be greater than zero and less than one.")
-        if not 1 <= self.simulation_days <= 100:
-            raise ValueError("Simulation days must be between 1 and 100.")
+class Task:
+    beds: int
+    initial_patients: int
+    max_steps: int = 20
+    arrival_rate: float = 1.0
 
 
-def _poisson_support(rate: float, limit: int) -> list[tuple[int, float, float]]:
-    """Return count, probability, and conditional mean, folding the tail at limit."""
-    support: list[tuple[int, float, float]] = []
-    for count in range(limit):
-        probability = float(poisson.pmf(count, rate))
-        if probability > 1e-12:
-            support.append((count, probability, float(count)))
+STANDARD_TASK = Task(beds=8, initial_patients=8, arrival_rate=1.5)
 
-    tail_probability = float(poisson.sf(limit - 1, rate))
-    if tail_probability > 1e-12:
-        tail_mean = rate * float(poisson.sf(limit - 2, rate)) / tail_probability
-        support.append((limit, tail_probability, tail_mean))
-    return support
+TREATMENT_REWARD: dict[Severity, float] = {"low": 1.0, "medium": 2.0, "high": 3.0}
+EMERGENCY_BONUS = 1.0
+HIGH_UNTREATED_PENALTY = -2.0
+EMERGENCY_UNTREATED_PENALTY = -1.5
+WASTED_BED_PENALTY = -0.3
+DETERIORATION_PENALTY = -0.5
+EMERGENCY_ARRIVAL_PROBABILITY = 0.2
+DETERIORATION_PROBABILITY = 0.2
 
 
-class PolicySolver:
-    """Value-iterate a finite state MDP over ward capacity and free beds."""
+class PatientObservation(TypedDict):
+    id: int
+    severity: Severity
+    emergency: bool
 
-    def __init__(self, config: SimulationConfig) -> None:
-        config.validate()
-        self.config = config
-        self.states: list[State] = []
-        self._state_index: dict[State, int] = {}
-        self._ward_rewards: list[list[np.ndarray]] = []
-        self._ward_transitions: list[list[np.ndarray]] = []
-        self.policy: dict[State, int] = {}
-        self.values: dict[State, float] = {}
-        self.iterations = 0
-        self._create_states()
-        self._create_transitions()
-        self._solve()
 
-    def _create_states(self) -> None:
-        total = self.config.total_beds
-        for normal_capacity in range(total + 1):
-            covid_capacity = total - normal_capacity
-            for normal_available in range(normal_capacity + 1):
-                for covid_available in range(covid_capacity + 1):
-                    state = (normal_capacity, normal_available, covid_available)
-                    self._state_index[state] = len(self.states)
-                    self.states.append(state)
+class Observation(TypedDict):
+    beds: int
+    patients: list[PatientObservation]
+    step: int
+    max_steps: int
+    done: bool
 
-    def _create_transitions(self) -> None:
-        total = self.config.total_beds
-        ward_parameters = (
-            (
-                self.config.normal_arrivals,
-                self.config.normal_discharges,
-                10.0,
-            ),
-            (
-                self.config.covid_arrivals,
-                self.config.covid_discharges,
-                20.0,
-            ),
-        )
-        for arrivals, discharges, unmet_cost in ward_parameters:
-            request_support = _poisson_support(arrivals, total + 1)
-            discharge_support = _poisson_support(discharges, total + 1)
-            ward_rewards: list[np.ndarray] = []
-            ward_transitions: list[np.ndarray] = []
-            for capacity in range(total + 1):
-                rewards = np.zeros(capacity + 1, dtype=float)
-                transitions = np.zeros((capacity + 1, capacity + 1), dtype=float)
-                for available in range(capacity + 1):
-                    for request, request_probability, mean_request in request_support:
-                        admitted = min(request, available)
-                        unmet = max(mean_request - admitted, 0.0)
-                        occupied_after_request = capacity - available + admitted
-                        available_after_request = available - admitted
-                        for returned, return_probability, _ in discharge_support:
-                            discharged = min(returned, occupied_after_request)
-                            probability = request_probability * return_probability
-                            next_available = available_after_request + discharged
-                            transitions[available, next_available] += probability
-                            rewards[available] -= probability * unmet_cost * unmet
-                ward_rewards.append(rewards)
-                ward_transitions.append(transitions)
-            self._ward_rewards.append(ward_rewards)
-            self._ward_transitions.append(ward_transitions)
 
-    @lru_cache(maxsize=None)
-    def actions(self, state: State) -> tuple[tuple[int, State], ...]:
-        normal_capacity, normal_available, covid_available = state
-        min_action = -covid_available
-        max_action = normal_available
-        actions = []
-        for action in range(min_action, max_action + 1):
-            next_state = (
-                normal_capacity - action,
-                normal_available - action,
-                covid_available + action,
-            )
-            actions.append((action, next_state))
-        return tuple(actions)
+class StepInfo(TypedDict):
+    allocated: int
+    treated: int
+    treated_patients: list[PatientObservation]
+    arrivals: int
+    emergency_arrivals: int
+    occupied_beds: int
+    reward_components: dict[str, float]
 
-    def _solve(self) -> None:
-        total = self.config.total_beds
-        value = np.zeros((total + 1, total + 1, total + 1), dtype=float)
-        policy = np.zeros((total + 1, total + 1, total + 1), dtype=int)
-        gamma = self.config.discount_rate
 
-        for iteration in range(1, 101):
-            updated = np.empty_like(value)
-            updated.fill(0.0)
-            future_by_capacity: list[np.ndarray] = []
-            for normal_capacity in range(total + 1):
-                covid_capacity = total - normal_capacity
-                normal_transitions = self._ward_transitions[0][normal_capacity]
-                covid_transitions = self._ward_transitions[1][covid_capacity]
-                future_by_capacity.append(
-                    normal_transitions
-                    @ value[
-                        normal_capacity,
-                        : normal_capacity + 1,
-                        : covid_capacity + 1,
-                    ]
-                    @ covid_transitions.T
-                )
+@dataclass
+class Patient:
+    id: int
+    severity: Severity
+    emergency: bool = False
+    remaining_stay: int = 0
 
-            for normal_capacity in range(total + 1):
-                covid_capacity = total - normal_capacity
-                for normal_available in range(normal_capacity + 1):
-                    for covid_available in range(covid_capacity + 1):
-                        state = (
-                            normal_capacity,
-                            normal_available,
-                            covid_available,
-                        )
-                        best_value = -float("inf")
-                        best_action = 0
-                        for action, next_state in self.actions(state):
-                            next_normal_capacity = next_state[0]
-                            next_covid_capacity = total - next_normal_capacity
-                            immediate_reward = (
-                                self._ward_rewards[0][next_normal_capacity][
-                                    next_state[1]
-                                ]
-                                + self._ward_rewards[1][next_covid_capacity][
-                                    next_state[2]
-                                ]
-                                - 5.0 * abs(action)
-                            )
-                            action_value = immediate_reward + gamma * (
-                                future_by_capacity[next_normal_capacity][
-                                    next_state[1], next_state[2]
-                                ]
-                            )
-                            if action_value > best_value + 1e-10 or (
-                                abs(action_value - best_value) <= 1e-10
-                                and abs(action) < abs(best_action)
-                            ):
-                                best_value = action_value
-                                best_action = action
-                        updated[normal_capacity, normal_available, covid_available] = (
-                            best_value
-                        )
-                        policy[
-                            normal_capacity, normal_available, covid_available
-                        ] = best_action
-
-            delta = float(np.max(np.abs(updated - value)))
-            value = updated
-            if delta < 1e-4:
-                self.iterations = iteration
-                break
-        else:
-            self.iterations = 100
-
-        self.values = {
-            state: float(value[state[0], state[1], state[2]])
-            for state in self.states
-        }
-        self.policy = {
-            state: int(policy[state[0], state[1], state[2]])
-            for state in self.states
+    def observe(self) -> PatientObservation:
+        return {
+            "id": self.id,
+            "severity": self.severity,
+            "emergency": self.emergency,
         }
 
-    def action_for(self, state: State) -> int:
-        return self.policy[state]
 
-    def expected_reward(self, state: State) -> float:
-        normal_capacity, normal_available, covid_available = state
-        covid_capacity = self.config.total_beds - normal_capacity
-        return float(
-            self._ward_rewards[0][normal_capacity][normal_available]
-            + self._ward_rewards[1][covid_capacity][covid_available]
-        )
+class HospitalEnvironment:
+    """Episodic bed-allocation environment for an external RL agent."""
 
+    def __init__(self, seed: int | None = None) -> None:
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+        self.reset()
 
-class HospitalSimulator:
-    """Reproducible day-by-day simulator using the solver's policy."""
-
-    def __init__(self, config: SimulationConfig) -> None:
-        config.validate()
-        self.config = config
-        self.rng = np.random.default_rng(config.seed)
-        self.day = 0
-        self.normal_capacity = config.normal_beds
-        self.covid_capacity = config.covid_beds
-        self.normal_available = self.normal_capacity
-        self.covid_available = self.covid_capacity
-        self.total_unmet_normal = 0
-        self.total_unmet_covid = 0
-        self.total_moved = 0
+    def reset(self, seed: int | None = None) -> Observation:
+        if seed is not None:
+            self.seed = seed
+        self.config = STANDARD_TASK
+        self.rng = np.random.default_rng(self.seed)
+        self.step_number = 0
         self.total_reward = 0.0
-        self.history: list[dict[str, int | float]] = [
-            {
-                "day": 0,
-                "normal_available": self.normal_available,
-                "covid_available": self.covid_available,
-                "normal_occupied": 0,
-                "covid_occupied": 0,
-                "normal_unmet": 0,
-                "covid_unmet": 0,
-                "reward": 0.0,
-                "beds_moved": 0,
-            }
-        ]
+        self.next_patient_id = 1
+        self.waiting: list[Patient] = []
+        self.occupied: list[Patient] = []
+        for _ in range(self.config.initial_patients):
+            self.waiting.append(self._new_patient())
+        self.history: list[dict[str, int | float]] = []
+        self._record_history(
+            reward=0.0,
+            reward_components={},
+            arrivals=0,
+            emergency_arrivals=0,
+        )
+        return self.state()
 
     @property
-    def state(self) -> State:
-        return (
-            self.normal_capacity,
-            self.normal_available,
-            self.covid_available,
-        )
+    def done(self) -> bool:
+        return self.step_number >= self.config.max_steps
 
     @property
-    def finished(self) -> bool:
-        return self.day >= self.config.simulation_days
+    def beds_available(self) -> int:
+        return self.config.beds - len(self.occupied)
 
-    def step(self, policy: PolicySolver) -> dict[str, int | float]:
-        if self.finished:
-            raise RuntimeError("The simulation has already reached its configured duration.")
-
-        old_state = self.state
-        action = policy.action_for(old_state)
-        self.normal_capacity -= action
-        self.covid_capacity += action
-        self.normal_available -= action
-        self.covid_available += action
-
-        requests_normal = int(self.rng.poisson(self.config.normal_arrivals))
-        requests_covid = int(self.rng.poisson(self.config.covid_arrivals))
-        admissions_normal = min(requests_normal, self.normal_available)
-        admissions_covid = min(requests_covid, self.covid_available)
-        unmet_normal = requests_normal - admissions_normal
-        unmet_covid = requests_covid - admissions_covid
-        self.normal_available -= admissions_normal
-        self.covid_available -= admissions_covid
-
-        occupied_normal = self.normal_capacity - self.normal_available
-        occupied_covid = self.covid_capacity - self.covid_available
-        discharged_normal = min(
-            int(self.rng.poisson(self.config.normal_discharges)), occupied_normal
-        )
-        discharged_covid = min(
-            int(self.rng.poisson(self.config.covid_discharges)), occupied_covid
-        )
-        self.normal_available += discharged_normal
-        self.covid_available += discharged_covid
-
-        moved = abs(action)
-        reward = -10 * unmet_normal - 20 * unmet_covid - 5 * moved
-        self.day += 1
-        self.total_unmet_normal += unmet_normal
-        self.total_unmet_covid += unmet_covid
-        self.total_moved += moved
-        self.total_reward += reward
-        record: dict[str, int | float] = {
-            "day": self.day,
-            "normal_available": self.normal_available,
-            "covid_available": self.covid_available,
-            "normal_occupied": self.normal_capacity - self.normal_available,
-            "covid_occupied": self.covid_capacity - self.covid_available,
-            "normal_unmet": unmet_normal,
-            "covid_unmet": unmet_covid,
-            "reward": float(reward),
-            "beds_moved": moved,
-            "action": action,
-            "requests_normal": requests_normal,
-            "requests_covid": requests_covid,
-            "admissions_normal": admissions_normal,
-            "admissions_covid": admissions_covid,
-            "discharged_normal": discharged_normal,
-            "discharged_covid": discharged_covid,
+    def state(self) -> Observation:
+        return {
+            "beds": self.beds_available,
+            "patients": [patient.observe() for patient in self.waiting],
+            "step": self.step_number,
+            "max_steps": self.config.max_steps,
+            "done": self.done,
         }
-        self.history.append(record)
-        return record
+
+    def grade(self) -> float:
+        """Map raw return monotonically into the API's (0.001, 0.999) range."""
+        scale = max(float(self.config.max_steps), 1.0)
+        normalized_return = float(np.clip(self.total_reward / scale, -60.0, 60.0))
+        logistic = 1.0 / (1.0 + np.exp(-normalized_return))
+        return float(0.001 + 0.998 * logistic)
+
+    def step(self, allocate: int) -> tuple[Observation, float, bool, StepInfo]:
+        if self.done:
+            raise RuntimeError("Episode is complete; reset before taking another step.")
+        if isinstance(allocate, bool) or not isinstance(allocate, Integral):
+            raise ValueError("allocate must be an integer.")
+        allocate = int(allocate)
+        if allocate < 0:
+            raise ValueError("allocate must be zero or greater.")
+        if allocate > min(self.beds_available, len(self.waiting)):
+            raise ValueError(
+                "allocate cannot exceed available beds or the number of waiting patients."
+            )
+
+        self._advance_discharges()
+        reward_components = {
+            "treated": 0.0,
+            "emergency_bonus": 0.0,
+            "untreated_high": 0.0,
+            "untreated_emergency": 0.0,
+            "wasted_bed": 0.0,
+            "deterioration": 0.0,
+        }
+
+        treated = self._select_patients(allocate)
+        for patient in treated:
+            reward_components["treated"] += TREATMENT_REWARD[patient.severity]
+            if patient.emergency:
+                reward_components["emergency_bonus"] += EMERGENCY_BONUS
+            patient.remaining_stay = int(self.rng.integers(1, 4))
+            self.occupied.append(patient)
+
+        if self.waiting:
+            idle_beds = self.beds_available
+            wasted = min(idle_beds, len(self.waiting))
+            reward_components["wasted_bed"] = WASTED_BED_PENALTY * wasted
+
+        still_waiting: list[Patient] = []
+        for patient in self.waiting:
+            if patient.severity == "high":
+                reward_components["untreated_high"] += HIGH_UNTREATED_PENALTY
+            if patient.emergency:
+                reward_components["untreated_emergency"] += (
+                    EMERGENCY_UNTREATED_PENALTY
+                )
+            if (
+                patient.severity != "high"
+                and self.rng.random() < DETERIORATION_PROBABILITY
+            ):
+                patient.severity = self._next_severity(patient.severity)
+                reward_components["deterioration"] += DETERIORATION_PENALTY
+            still_waiting.append(patient)
+        self.waiting = still_waiting
+
+        arrivals = (
+            []
+            if self.step_number + 1 >= self.config.max_steps
+            else self._generate_arrivals()
+        )
+        self.waiting.extend(arrivals)
+        self.step_number += 1
+
+        reward = float(sum(reward_components.values()))
+        self.total_reward += reward
+        info: StepInfo = {
+            "allocated": allocate,
+            "treated": len(treated),
+            "treated_patients": [patient.observe() for patient in treated],
+            "arrivals": len(arrivals),
+            "emergency_arrivals": sum(patient.emergency for patient in arrivals),
+            "occupied_beds": len(self.occupied),
+            "reward_components": reward_components,
+        }
+        self._record_history(
+            reward=reward,
+            reward_components=reward_components,
+            arrivals=len(arrivals),
+            emergency_arrivals=int(info["emergency_arrivals"]),
+        )
+        return self.state(), reward, self.done, info
+
+    def _record_history(
+        self,
+        reward: float,
+        reward_components: dict[str, float],
+        arrivals: int,
+        emergency_arrivals: int,
+    ) -> None:
+        severity_counts = {
+            severity: sum(patient.severity == severity for patient in self.waiting)
+            for severity in ("high", "medium", "low")
+        }
+        self.history.append(
+            {
+                "step": self.step_number,
+                "waiting": len(self.waiting),
+                "waiting_high": severity_counts["high"],
+                "waiting_medium": severity_counts["medium"],
+                "waiting_low": severity_counts["low"],
+                "waiting_emergency": sum(
+                    patient.emergency for patient in self.waiting
+                ),
+                "occupied_beds": len(self.occupied),
+                "available_beds": self.beds_available,
+                "arrivals": arrivals,
+                "emergency_arrivals": emergency_arrivals,
+                "reward": reward,
+                "cumulative_reward": self.total_reward,
+                **{
+                    f"reward_{name}": amount
+                    for name, amount in reward_components.items()
+                },
+            }
+        )
+
+    def _new_patient(self, emergency: bool = False) -> Patient:
+        severity = self.rng.choice(
+            ("low", "medium", "high"),
+            p=(0.5, 0.3, 0.2),
+        )
+        if emergency:
+            severity = "high"
+        patient = Patient(
+            id=self.next_patient_id,
+            severity=severity,  # type: ignore[arg-type]
+            emergency=emergency,
+        )
+        self.next_patient_id += 1
+        return patient
+
+    def _select_patients(self, allocate: int) -> list[Patient]:
+        priority = sorted(
+            self.waiting,
+            key=lambda patient: (
+                patient.emergency,
+                SEVERITY_LEVEL[patient.severity],
+                -patient.id,
+            ),
+            reverse=True,
+        )
+        treated = priority[:allocate]
+        treated_ids = {patient.id for patient in treated}
+        self.waiting = [
+            patient for patient in self.waiting if patient.id not in treated_ids
+        ]
+        return treated
+
+    @staticmethod
+    def _next_severity(severity: Severity) -> Severity:
+        return "medium" if severity == "low" else "high"
+
+    def _advance_discharges(self) -> None:
+        remaining: list[Patient] = []
+        for patient in self.occupied:
+            patient.remaining_stay -= 1
+            if patient.remaining_stay > 0:
+                remaining.append(patient)
+        self.occupied = remaining
+
+    def _generate_arrivals(self) -> list[Patient]:
+        arrivals = [
+            self._new_patient()
+            for _ in range(int(self.rng.poisson(self.config.arrival_rate)))
+        ]
+        if self.rng.random() < EMERGENCY_ARRIVAL_PROBABILITY:
+            arrivals.append(self._new_patient(emergency=True))
+        return arrivals
 
 
-if __name__ == "__main__":
-    default_config = SimulationConfig()
-    solver = PolicySolver(default_config)
-    starting_state = (
-        default_config.normal_beds,
-        default_config.normal_beds,
-        default_config.covid_beds,
-    )
-    print(f"Policy converged in {solver.iterations} iterations.")
-    print(f"Recommended transfer: {solver.action_for(starting_state):+d} beds.")
+class QLearningAgent:
+    """Tabular Q-learning agent for choosing how many waiting patients to treat."""
+
+    def __init__(
+        self,
+        training_episodes: int = 1_200,
+        learning_rate: float = 0.15,
+        discount_factor: float = 0.95,
+        seed: int = 2026,
+    ) -> None:
+        if training_episodes < 1:
+            raise ValueError("training_episodes must be positive.")
+        if not 0 < learning_rate <= 1:
+            raise ValueError("learning_rate must be in (0, 1].")
+        if not 0 <= discount_factor < 1:
+            raise ValueError("discount_factor must be in [0, 1).")
+        self.training_episodes = training_episodes
+        self.learning_rate = learning_rate
+        self.discount_factor = discount_factor
+        self.seed = seed
+        self.q_table: defaultdict[tuple[int, ...], dict[int, float]] = defaultdict(
+            dict
+        )
+        self.episode_returns: list[float] = []
+        self.trained = False
+
+    @staticmethod
+    def state_key(observation: Observation) -> tuple[int, ...]:
+        patients = observation["patients"]
+        high = sum(patient["severity"] == "high" for patient in patients)
+        medium = sum(patient["severity"] == "medium" for patient in patients)
+        low = sum(patient["severity"] == "low" for patient in patients)
+        emergencies = sum(patient["emergency"] for patient in patients)
+        queue_cap = 2 * STANDARD_TASK.beds
+        return (
+            observation["beds"],
+            min(high, queue_cap),
+            min(medium, queue_cap),
+            min(low, queue_cap),
+            min(emergencies, queue_cap),
+            observation["max_steps"] - observation["step"],
+        )
+
+    @staticmethod
+    def valid_actions(observation: Observation) -> range:
+        maximum = min(observation["beds"], len(observation["patients"]))
+        return range(maximum + 1)
+
+    def q_value(self, observation: Observation, action: int) -> float:
+        return self.q_table.get(self.state_key(observation), {}).get(action, 0.0)
+
+    def choose_action(self, observation: Observation) -> int:
+        actions = self.valid_actions(observation)
+        state = self.state_key(observation)
+        action_values = self.q_table.get(state, {})
+        return max(actions, key=lambda action: (action_values.get(action, 0.0), action))
+
+    def train(self) -> None:
+        self.q_table.clear()
+        self.episode_returns.clear()
+        rng = np.random.default_rng(self.seed)
+        alpha = self.learning_rate
+        gamma = self.discount_factor
+
+        for episode in range(self.training_episodes):
+            environment = HospitalEnvironment(seed=self.seed + episode)
+            observation = environment.state()
+            episode_return = 0.0
+            progress = episode / max(self.training_episodes - 1, 1)
+            epsilon = max(0.03, 0.35 * (1.0 - progress))
+
+            while not observation["done"]:
+                state = self.state_key(observation)
+                actions = self.valid_actions(observation)
+                if rng.random() < epsilon:
+                    action = int(rng.choice(list(actions)))
+                else:
+                    action = self.choose_action(observation)
+
+                next_observation, reward, done, _ = environment.step(action)
+                next_state = self.state_key(next_observation)
+                current_q = self.q_table[state].get(action, 0.0)
+                if done:
+                    target = reward
+                else:
+                    next_actions = self.valid_actions(next_observation)
+                    next_values = self.q_table.get(next_state, {})
+                    target = reward + gamma * max(
+                        next_values.get(next_action, 0.0)
+                        for next_action in next_actions
+                    )
+                self.q_table[state][action] = current_q + alpha * (
+                    target - current_q
+                )
+                episode_return += reward
+                observation = next_observation
+
+            self.episode_returns.append(episode_return)
+
+        self.trained = True
