@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import time
+from html import escape
 from typing import Any
 
 import pandas as pd
@@ -36,34 +37,79 @@ st.markdown(
     [data-testid="stMetricLabel"] {color: #62758a;}
     [data-testid="stMetricValue"] {color: #24364b;}
     .bed-grid {
-        display: grid; grid-template-columns: repeat(4, minmax(92px, 1fr));
+        display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
         gap: 12px; margin: 1rem 0;
     }
+    .ward-panels {
+        display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        align-items: stretch; gap: 1.25rem; margin: 1rem 0 1.5rem;
+    }
+    .ward-panel {
+        box-sizing: border-box; min-width: 0; height: 100%;
+        display: flex; flex-direction: column;
+        padding: 1.15rem; border: 1px solid #dbe7f5; border-radius: 14px;
+        background: #fff; box-shadow: 0 2px 8px rgba(37, 99, 235, 0.04);
+    }
+    .ward-panel .ward-panel-title {
+        margin: 0; color: #24364b; font-size: 1.15rem;
+        font-weight: 700; line-height: 1.3;
+    }
+    .ward-panel-caption {
+        margin: 0.35rem 0 0.25rem; color: #62758a; font-size: 0.9rem;
+    }
     .bed {
-        min-height: 94px; display: flex; flex-direction: column;
-        justify-content: center; align-items: center; gap: 5px;
+        min-height: 138px; box-sizing: border-box;
+        display: flex; flex-direction: column;
+        justify-content: center; align-items: center; gap: 7px;
         border-radius: 11px; background: #eaf3ff; color: #1683f8;
         font: 600 0.78rem sans-serif;
+        line-height: 1.35; text-align: center; padding: 10px 7px;
     }
     .bed.free {background: #f0f3f7; color: #9aa9b9;}
     .bed svg {width: 50px; height: 42px;}
+    .bed .patient-icon {width: 25px; height: 25px; color: #426b9a;}
+    .bed-patient {font-size: 0.72rem; color: #24364b; overflow-wrap: anywhere;}
+    .patient-grid {
+        display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-auto-rows: minmax(150px, 1fr); gap: 12px; margin-top: 0.7rem;
+    }
     .patient-card {
-        min-height: 104px; border-radius: 11px; padding: 10px;
-        text-align: center; margin: 0 0 10px; border: 1px solid #e5eaf0;
+        box-sizing: border-box; min-width: 0; min-height: 150px;
+        display: flex; flex-direction: column; align-items: center;
+        justify-content: center; gap: 9px; border-radius: 12px;
+        padding: 16px 12px; text-align: center;
+        border: 1px solid #e5eaf0;
     }
     .patient-card.high {background: #fff0f0; border-color: #ffd1d1;}
     .patient-card.medium {background: #fff8e8; border-color: #ffe8af;}
     .patient-card.low {background: #eafaf3; border-color: #c5f1dd;}
-    .patient-id {font-weight: 700; color: #24364b; margin-bottom: 8px;}
+    .patient-icon {width: 38px; height: 38px; flex: 0 0 auto;}
+    .patient-card.high .patient-icon {color: #b42318;}
+    .patient-card.medium .patient-icon {color: #9a5b00;}
+    .patient-card.low .patient-icon {color: #087443;}
+    .patient-id {font-weight: 700; color: #24364b; line-height: 1.3;}
     .severity {
-        display: inline-block; border-radius: 20px; padding: 3px 10px;
+        display: inline-block; border-radius: 20px; padding: 5px 12px;
         font-size: 0.78rem; font-weight: 700;
     }
     .high .severity {background: #ffd7d7; color: #b42318;}
     .medium .severity {background: #ffebbd; color: #9a5b00;}
     .low .severity {background: #c8f2dd; color: #087443;}
-    .emergency {margin-top: 7px; font-size: 0.75rem; color: #c62828; font-weight: 700;}
-    .regular {margin-top: 7px; font-size: 0.75rem; color: #62758a;}
+    .emergency {
+        border-radius: 20px; padding: 4px 9px;
+        background: #ffe1e1; color: #b42318;
+        font-size: 0.7rem; font-weight: 700;
+    }
+    .empty-state {
+        display: flex; min-height: 150px; align-items: center;
+        justify-content: center; border: 1px dashed #cbd8e6;
+        border-radius: 12px; color: #62758a; text-align: center;
+        padding: 1rem;
+    }
+    @media (max-width: 900px) {
+        .ward-panels {grid-template-columns: 1fr; gap: 1rem;}
+        .patient-grid {grid-template-columns: repeat(2, minmax(0, 1fr));}
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -76,6 +122,13 @@ BED_ICON = """
         stroke-linecap="round" stroke-linejoin="round"/>
   <path d="M14 39v5m39-5v5" fill="none" stroke="currentColor"
         stroke-width="4" stroke-linecap="round"/>
+</svg>
+"""
+
+PATIENT_ICON = """
+<svg class="patient-icon" viewBox="0 0 24 24" aria-hidden="true">
+  <circle cx="12" cy="7" r="4" fill="currentColor"/>
+  <path d="M4 21a8 8 0 0 1 16 0v1H4z" fill="currentColor"/>
 </svg>
 """
 
@@ -107,11 +160,32 @@ def initialize_session_state() -> None:
 initialize_session_state()
 agent: QLearningAgent = st.session_state.agent
 
+recent_return = sum(agent.episode_returns[-100:]) / min(
+    100, len(agent.episode_returns)
+)
 st.title("OptiBed")
 st.caption(
     "Watch a Q-learning agent make automatic bed-allocation decisions in a "
     "20-step hospital episode."
 )
+with st.container(border=True):
+    st.subheader("Agent overview")
+    agent_metrics = st.columns(5)
+    agent_metrics[0].metric("Algorithm", "Q-learning")
+    agent_metrics[1].metric("Training episodes", f"{agent.training_episodes:,}")
+    agent_metrics[2].metric(
+        "Learned states",
+        f"{len(agent.trained_q_table):,}",
+    )
+    agent_metrics[3].metric("Mean return · last 100", f"{recent_return:+.1f}")
+    agent_metrics[4].metric(
+        "Playback interval",
+        f"{PLAYBACK_INTERVAL_SECONDS:.1f}s",
+    )
+    st.caption(
+        "The agent was trained before playback. Start runs its learned "
+        "policy; Stop pauses it; Reset starts a fresh episode."
+    )
 simulation_tab, graphs_tab, training_tab = st.tabs(
     ["Simulation", "Graphs", "Training"]
 )
@@ -171,26 +245,26 @@ def execution_dataframe(metrics: list[dict[str, object]]) -> pd.DataFrame:
     )
 
 
-def render_patient_cards(waiting: list[dict[str, Any]]) -> None:
+def patient_cards_markup(waiting: list[dict[str, Any]]) -> str:
     if not waiting:
-        st.success("Everyone in the waiting list has been treated.")
-        return
-    for start in range(0, len(waiting), 4):
-        patient_columns = st.columns(4)
-        for column, patient in zip(patient_columns, waiting[start : start + 4]):
-            severity = patient["severity"]
-            emergency_label = (
-                '<div class="emergency">Emergency</div>'
-                if patient["emergency"]
-                else '<div class="regular">Waiting</div>'
-            )
-            column.markdown(
-                f'<div class="patient-card {severity}">'
-                f'<div class="patient-id">Patient {patient["id"]}</div>'
-                f'<span class="severity">{severity.title()}</span>'
-                f"{emergency_label}</div>",
-                unsafe_allow_html=True,
-            )
+        return '<div class="empty-state">No patients are currently waiting.</div>'
+
+    cards = []
+    for patient in waiting:
+        severity = escape(patient["severity"])
+        emergency_label = (
+            '<span class="emergency">Emergency</span>'
+            if patient["emergency"]
+            else ""
+        )
+        cards.append(
+            f'<div class="patient-card {severity}">'
+            f"{PATIENT_ICON}"
+            f'<div class="patient-id">Patient #{patient["id"]}</div>'
+            f'<span class="severity">{severity.title()}</span>'
+            f"{emergency_label}</div>"
+        )
+    return f'<div class="patient-grid">{"".join(cards)}</div>'
 
 
 def render_transition(transition: dict[str, Any]) -> None:
@@ -350,53 +424,50 @@ def render_simulation() -> None:
         text=f"Episode progress · step {state['step']} of {state['max_steps']}",
     )
 
-    hospital_column, queue_column = st.columns([1, 2.4], gap="large")
-    with hospital_column:
-        with st.container(border=True):
-            st.subheader("Hospital beds")
-            st.caption(
-                f"{occupied} of {beds_total} beds are in use. "
-                f"{state['beds']} are ready for patients."
+    bed_slots = []
+    for bed_number in range(beds_total):
+        in_use = bed_number < occupied
+        style = "bed" if in_use else "bed free"
+        if in_use:
+            patient = environment.occupied[bed_number]
+            emergency_label = (
+                " · Emergency" if patient.emergency else ""
             )
-            bed_slots = []
-            for bed_number in range(beds_total):
-                in_use = bed_number < occupied
-                style = "bed" if in_use else "bed free"
-                label = "In use" if in_use else "Available"
-                bed_slots.append(
-                    f'<div class="{style}">{BED_ICON}<span>'
-                    f"Bed {bed_number + 1:02d} · {label}</span></div>"
-                )
-            st.markdown(
-                f'<div class="bed-grid">{"".join(bed_slots)}</div>',
-                unsafe_allow_html=True,
+            bed_slots.append(
+                f'<div class="{style}">{BED_ICON}'
+                f"{PATIENT_ICON}"
+                f'<span>Bed {bed_number + 1:02d}</span>'
+                f'<span class="bed-patient">'
+                f"Patient #{patient.id} · {escape(patient.severity.title())}"
+                f"{emergency_label}</span></div>"
             )
-        with st.container(border=True):
-            st.subheader("Agent")
-            st.write("**Algorithm:** tabular Q-learning")
-            st.write(f"**Training episodes:** {agent.training_episodes:,}")
-            st.write(f"**Learned states:** {len(agent.q_table):,}")
-            recent_return = sum(agent.episode_returns[-100:]) / min(
-                100, len(agent.episode_returns)
-            )
-            st.write(f"**Mean return (last 100 training episodes):** {recent_return:+.1f}")
-            st.write(f"**Playback:** one decision every {PLAYBACK_INTERVAL_SECONDS:.1f}s")
-            st.caption(
-                "The agent was trained before playback. Start runs its learned "
-                "policy; Stop pauses it; Reset starts a fresh episode."
+        else:
+            bed_slots.append(
+                f'<div class="{style}">{BED_ICON}<span>'
+                f"Bed {bed_number + 1:02d} · Available</span></div>"
             )
 
-    with queue_column:
-        with st.container(border=True):
-            st.subheader(f"Patients waiting · {len(waiting)}")
-            st.caption("Emergency patients and severity are identified on each card.")
-            render_patient_cards(waiting)
-        if st.session_state.last_step is not None:
-            render_transition(st.session_state.last_step)
-        elif state["step"] == 0:
-            st.info("Press Start to watch the trained agent make its first decision.")
-        if state["done"]:
-            st.success("Episode complete. Press Reset to run another episode.")
+    ward_panels = (
+        '<div class="ward-panels">'
+        '<section class="ward-panel">'
+        '<h2 class="ward-panel-title">Hospital beds</h2>'
+        '<p class="ward-panel-caption">'
+        f"{occupied} of {beds_total} beds in use · "
+        f"{state['beds']} available</p>"
+        f'<div class="bed-grid">{"".join(bed_slots)}</div>'
+        "</section>"
+        '<section class="ward-panel">'
+        f'<h2 class="ward-panel-title">Patients waiting · {len(waiting)}</h2>'
+        '<p class="ward-panel-caption">'
+        "Severity is shown on each card; emergencies are flagged.</p>"
+        f"{patient_cards_markup(waiting)}"
+        "</section></div>"
+    )
+    st.markdown(ward_panels, unsafe_allow_html=True)
+    if st.session_state.last_step is not None:
+        render_transition(st.session_state.last_step)
+    if state["done"]:
+        st.success("Episode complete. Press Reset to run another episode.")
 
     playback = execution_dataframe(agent.execution_metrics)
     with st.container(border=True):

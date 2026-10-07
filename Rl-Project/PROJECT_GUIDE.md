@@ -175,6 +175,10 @@ The app sets a wide page layout, defines CSS and a small inline bed SVG, then ge
 
 The first app load includes model training (1,200 episodes by default). Streamlit reruns reuse the cached agent resource.
 
+An agent overview is displayed below the OptiBed title and episode description,
+including the algorithm, training episode count, trained-state count, recent
+training return, and playback interval.
+
 ### Simulation tab
 
 The Simulation tab displays:
@@ -182,12 +186,20 @@ The Simulation tab displays:
 - Start, Stop, and Reset controls;
 - bed availability, waiting queue size, cumulative reward, and grade;
 - progress through the 20-step episode;
-- a grid of bed icons and patient cards colored/labeled by severity and emergency status;
-- current training summary and information about the policy;
+- equally sized, equal-height hospital-bed and waiting-patient panels with
+  responsive layouts;
+- bed icons annotated with the currently occupying patient's ID, severity, and
+  emergency status; these details disappear when the environment discharges that
+  patient;
+- spacious severity-colored user-icon patient cards; non-emergency cards omit a
+  redundant waiting badge, and an empty queue uses a subdued empty state;
 - the most recent observation, selected allocation, Q-value, reward breakdown, treated patients, next observation, and arrivals.
 - a per-step table of allocation, gross reward, penalty, net result, and reward-component details.
 
 When running, a Streamlit fragment reruns frequently to keep the UI responsive, but a decision is made only after the 1.8-second playback interval has elapsed. Start enables automatic greedy actions; Stop pauses them; Reset makes a new environment and clears the displayed last transition.
+
+Before the first decision, the dashboard leaves the transition area clear rather
+than showing a separate prompt banner.
 
 ### Graphs tab
 
