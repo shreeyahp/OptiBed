@@ -1,6 +1,6 @@
 # OptiBed
 
-OptiBed is a hospital bed-allocation simulation in which a tabular Q-learning agent learns how many waiting patients to treat at each step. The agent is trained on the environment, then runs a learned policy in the dashboard. Emergency and high-severity patients are prioritized when beds are allocated. The episode uses 8 beds, starts with 8 patients, and runs for 20 steps.
+OptiBed is a hospital bed-allocation simulation in which a tabular Q-learning agent learns how many waiting patients to treat at each step. The agent is trained on the environment, then runs a learned policy in the dashboard. Emergency and high-severity patients are prioritized when beds are allocated. The episode uses 8 beds, starts with 8 patients, and runs for 5 steps.
 
 ## Run
 

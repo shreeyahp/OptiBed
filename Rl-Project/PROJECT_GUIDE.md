@@ -51,7 +51,7 @@ There is no database or external queue, no authentication layer, no external RL 
 |---|---:|
 | Beds | 8 |
 | Initial waiting patients | 8 |
-| Episode length | 20 steps |
+| Episode length | 5 steps |
 | Regular arrivals | Poisson distribution with rate 1.5 per step |
 
 Reward amounts and event probabilities are module-level constants. The environment currently uses this one standard task by default; callers may replace `environment.config` directly in code (as tests do), but the HTTP API does not expose task configuration.
@@ -65,7 +65,7 @@ An `Observation` returned by the environment contains:
 - `beds`: beds currently available;
 - `patients`: the waiting queue, each as an observation;
 - `step` and `max_steps`: episode progress;
-- `done`: whether the 20-step episode has completed.
+- `done`: whether the 5-step episode has completed.
 
 Patients occupying beds are intentionally not included in the waiting-patient list. Their count is reflected by available beds. `StepInfo` provides additional transition details such as the selected patients, arrivals, occupied-bed count, and individual reward components.
 
@@ -185,7 +185,7 @@ The Simulation tab displays:
 
 - Start, Stop, and Reset controls;
 - bed availability, waiting queue size, cumulative reward, and grade;
-- progress through the 20-step episode;
+- progress through the 5-step episode;
 - equally sized, equal-height hospital-bed and waiting-patient panels with
   responsive layouts;
 - bed icons annotated with the currently occupying patient's ID, severity, and

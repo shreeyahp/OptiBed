@@ -166,7 +166,7 @@ recent_return = sum(agent.episode_returns[-100:]) / min(
 st.title("OptiBed")
 st.caption(
     "Watch a Q-learning agent make automatic bed-allocation decisions in a "
-    "20-step hospital episode."
+    "5-step hospital episode."
 )
 with st.container(border=True):
     st.subheader("Agent overview")
