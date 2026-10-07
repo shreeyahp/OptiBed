@@ -13,6 +13,7 @@ Severity = Literal["low", "medium", "high"]
 SEVERITY_LEVEL: dict[Severity, int] = {"low": 0, "medium": 1, "high": 2}
 
 
+# Scenario configuration and the fixed rewards/penalties used by the environment.
 @dataclass(frozen=True)
 class Task:
     beds: int
@@ -33,6 +34,8 @@ EMERGENCY_ARRIVAL_PROBABILITY = 0.2
 DETERIORATION_PROBABILITY = 0.2
 
 
+# These typed dictionaries describe the information shared between the
+# environment and an agent, without exposing every internal patient detail.
 class PatientObservation(TypedDict):
     id: int
     severity: Severity
@@ -57,6 +60,7 @@ class StepInfo(TypedDict):
     reward_components: dict[str, float]
 
 
+# Patient data and the hospital simulation environment.
 @dataclass
 class Patient:
     id: int
@@ -65,6 +69,7 @@ class Patient:
     remaining_stay: int = 0
 
     def observe(self) -> PatientObservation:
+        # Return only the details needed to make a decision about the queue.
         return {
             "id": self.id,
             "severity": self.severity,
@@ -81,6 +86,7 @@ class HospitalEnvironment:
         self.reset()
 
     def reset(self, seed: int | None = None) -> Observation:
+        # Start a new episode: clear progress and create the initial waiting queue.
         if seed is not None:
             self.seed = seed
         self.config = STANDARD_TASK
@@ -110,6 +116,7 @@ class HospitalEnvironment:
         return self.config.beds - len(self.occupied)
 
     def state(self) -> Observation:
+        # Present the current situation in a form the agent can inspect.
         return {
             "beds": self.beds_available,
             "patients": [patient.observe() for patient in self.waiting],
@@ -125,6 +132,7 @@ class HospitalEnvironment:
         logistic = 1.0 / (1.0 + np.exp(-normalized_return))
         return float(0.001 + 0.998 * logistic)
 
+    # Apply one allocation decision, advance the episode, and calculate reward.
     def step(self, allocate: int) -> tuple[Observation, float, bool, StepInfo]:
         if self.done:
             raise RuntimeError("Episode is complete; reset before taking another step.")
@@ -138,8 +146,8 @@ class HospitalEnvironment:
                 "allocate cannot exceed available beds or the number of waiting patients."
             )
 
-        beds_available_before_discharges = self.beds_available
-        self._advance_discharges()
+        # Beds freed at the end of the previous step are already available here.
+        beds_available_at_step_start = self.beds_available
         reward_components = {
             "treated": 0.0,
             "emergency_bonus": 0.0,
@@ -149,6 +157,7 @@ class HospitalEnvironment:
             "deterioration": 0.0,
         }
 
+        # Admit the selected patients and award treatment/emergency rewards.
         treated = self._select_patients(allocate)
         for patient in treated:
             reward_components["treated"] += TREATMENT_REWARD[patient.severity]
@@ -157,8 +166,9 @@ class HospitalEnvironment:
             patient.remaining_stay = int(self.rng.integers(1, 4))
             self.occupied.append(patient)
 
+        # Penalize idle capacity and patients left waiting; waiting patients may worsen.
         if self.waiting:
-            idle_beds = max(0, beds_available_before_discharges - len(treated))
+            idle_beds = max(0, beds_available_at_step_start - len(treated))
             wasted = min(idle_beds, len(self.waiting))
             reward_components["wasted_bed"] = WASTED_BED_PENALTY * wasted
 
@@ -179,6 +189,7 @@ class HospitalEnvironment:
             still_waiting.append(patient)
         self.waiting = still_waiting
 
+        # Add new patients except after the final step, then return the transition.
         arrivals = (
             []
             if self.step_number + 1 >= self.config.max_steps
@@ -186,6 +197,9 @@ class HospitalEnvironment:
         )
         self.waiting.extend(arrivals)
         self.step_number += 1
+        # Advance treatment stays after this step so the next observation reflects
+        # beds that have become free before the next action is selected.
+        self._advance_discharges()
 
         reward = float(sum(reward_components.values()))
         self.total_reward += reward
@@ -213,6 +227,7 @@ class HospitalEnvironment:
         arrivals: int,
         emergency_arrivals: int,
     ) -> None:
+        # Save a per-step snapshot for analysis; this is separate from the Q-table.
         severity_counts = {
             severity: sum(patient.severity == severity for patient in self.waiting)
             for severity in ("high", "medium", "low")
@@ -241,6 +256,7 @@ class HospitalEnvironment:
         )
 
     def _new_patient(self, emergency: bool = False) -> Patient:
+        # Regular patients get weighted severity; emergencies are always high severity.
         severity = self.rng.choice(
             ("low", "medium", "high"),
             p=(0.5, 0.3, 0.2),
@@ -256,6 +272,7 @@ class HospitalEnvironment:
         return patient
 
     def _select_patients(self, allocate: int) -> list[Patient]:
+        # Treat emergencies first, then higher severity, then earlier arrivals.
         priority = sorted(
             self.waiting,
             key=lambda patient: (
@@ -274,9 +291,11 @@ class HospitalEnvironment:
 
     @staticmethod
     def _next_severity(severity: Severity) -> Severity:
+        # Deterioration moves a patient up one severity level.
         return "medium" if severity == "low" else "high"
 
     def _advance_discharges(self) -> None:
+        # Reduce existing treatment stays and free beds for patients who finish.
         remaining: list[Patient] = []
         for patient in self.occupied:
             patient.remaining_stay -= 1
@@ -285,6 +304,7 @@ class HospitalEnvironment:
         self.occupied = remaining
 
     def _generate_arrivals(self) -> list[Patient]:
+        # Generate Poisson-distributed regular arrivals plus a possible emergency.
         arrivals = [
             self._new_patient()
             for _ in range(int(self.rng.poisson(self.config.arrival_rate)))
@@ -294,6 +314,9 @@ class HospitalEnvironment:
         return arrivals
 
 
+# REINFORCEMENT LEARNING STARTS HERE.
+# The agent learns Q-values: estimates of the long-term reward for each action
+# (number of patients treated) in each summarized situation.
 class QLearningAgent:
     """Tabular Q-learning agent for choosing how many waiting patients to treat."""
 
@@ -304,6 +327,7 @@ class QLearningAgent:
         discount_factor: float = 0.95,
         seed: int = 2026,
     ) -> None:
+        # Validate the learning settings before initializing the tables and metrics.
         if training_episodes < 1:
             raise ValueError("training_episodes must be positive.")
         if not 0 < learning_rate <= 1:
@@ -323,6 +347,7 @@ class QLearningAgent:
         self.execution_metrics: list[dict[str, object]] = []
         self.trained = False
 
+    # Convert the queue and episode progress into a compact Q-table state key.
     @staticmethod
     def state_key(observation: Observation) -> tuple[int, ...]:
         patients = observation["patients"]
@@ -330,6 +355,7 @@ class QLearningAgent:
         medium = sum(patient["severity"] == "medium" for patient in patients)
         low = sum(patient["severity"] == "low" for patient in patients)
         emergencies = sum(patient["emergency"] for patient in patients)
+        # Cap queue counts so unusually large queues do not create endless states.
         queue_cap = 2 * STANDARD_TASK.beds
         return (
             observation["beds"],
@@ -340,20 +366,24 @@ class QLearningAgent:
             observation["max_steps"] - observation["step"],
         )
 
+    # The action is how many patients to treat: from zero up to available capacity.
     @staticmethod
     def valid_actions(observation: Observation) -> range:
         maximum = min(observation["beds"], len(observation["patients"]))
         return range(maximum + 1)
 
     def q_value(self, observation: Observation, action: int) -> float:
+        # Unseen state/action pairs start with a Q-value of zero.
         return self.q_table.get(self.state_key(observation), {}).get(action, 0.0)
 
+    # Choose the valid action with the highest Q-value.
     def choose_action(self, observation: Observation) -> int:
         actions = self.valid_actions(observation)
         state = self.state_key(observation)
         action_values = self.q_table.get(state, {})
         return max(actions, key=lambda action: (action_values.get(action, 0.0), action))
 
+    # Update one Q-value after the environment supplies the reward and next state.
     def learn_from_transition(
         self,
         observation: Observation,
@@ -366,6 +396,7 @@ class QLearningAgent:
         if action not in self.valid_actions(observation):
             raise ValueError("action must be valid for the supplied observation.")
 
+        # Separate positive rewards from penalties for reporting the update clearly.
         components = reward_components or {}
         positive_reward = sum(max(amount, 0.0) for amount in components.values())
         penalty = -sum(min(amount, 0.0) for amount in components.values())
@@ -373,6 +404,7 @@ class QLearningAgent:
             positive_reward = max(reward, 0.0)
             penalty = max(-reward, 0.0)
 
+        # Estimate the target from this reward plus the best known future value.
         state = self.state_key(observation)
         next_state = self.state_key(next_observation)
         current_q = self.q_table[state].get(action, 0.0)
@@ -386,6 +418,7 @@ class QLearningAgent:
                 for next_action in next_actions
             )
 
+        # Move the old estimate partway toward the target, using the learning rate.
         td_error = target - current_q
         updated_q = current_q + self.learning_rate * td_error
         self.q_table[state][action] = updated_q
@@ -407,6 +440,7 @@ class QLearningAgent:
         return updated_q, td_error
 
     def train(self) -> None:
+        # Clear old results so calling train() again starts a fresh training run.
         self.q_table.clear()
         self.episode_returns.clear()
         self.training_metrics.clear()
@@ -418,6 +452,8 @@ class QLearningAgent:
         gamma = self.discount_factor
         total_transitions = 0
 
+        # Each episode is one full run; epsilon gradually shifts choices
+        # from random exploration toward the best-known action.
         for episode in range(self.training_episodes):
             environment = HospitalEnvironment(seed=self.seed + episode)
             observation = environment.state()
@@ -436,6 +472,7 @@ class QLearningAgent:
                 else:
                     action = self.choose_action(observation)
 
+                # Take the action, observe its outcome, and update this Q-table entry.
                 next_observation, reward, done, _ = environment.step(action)
                 next_state = self.state_key(next_observation)
                 current_q = self.q_table[state].get(action, 0.0)
@@ -455,6 +492,7 @@ class QLearningAgent:
                 episode_steps += 1
                 observation = next_observation
 
+            # Keep episode-level results and learning-progress measurements.
             self.episode_returns.append(episode_return)
             total_transitions += episode_steps
             recent_returns = self.episode_returns[-100:]
@@ -484,56 +522,8 @@ class QLearningAgent:
                 }
             )
 
+        # Preserve a snapshot of the completed training table.
         self.trained = True
         self.trained_q_table = {
             state: values.copy() for state, values in self.q_table.items()
         }
-
-
-def evaluate_policies(
-    agent: QLearningAgent,
-    episodes: int = 100,
-    seed: int | None = None,
-) -> dict[str, list[float]]:
-    """Evaluate the greedy policy and simple baselines on shared held-out seeds."""
-    if episodes < 1:
-        raise ValueError("episodes must be positive.")
-
-    first_seed = (
-        agent.seed + agent.training_episodes
-        if seed is None
-        else seed
-    )
-    policy_names = (
-        "Q-learning (greedy)",
-        "Always admit maximum",
-        "Random valid action",
-        "Never admit",
-    )
-    returns = {name: [] for name in policy_names}
-    random_action_rng = np.random.default_rng(first_seed + episodes)
-
-    for episode in range(episodes):
-        environment_seed = first_seed + episode
-        for policy_name in policy_names:
-            environment = HospitalEnvironment(seed=environment_seed)
-            observation = environment.state()
-
-            while not observation["done"]:
-                if policy_name == "Q-learning (greedy)":
-                    action = agent.choose_action(observation)
-                elif policy_name == "Always admit maximum":
-                    action = max(QLearningAgent.valid_actions(observation))
-                elif policy_name == "Random valid action":
-                    action = int(
-                        random_action_rng.choice(
-                            list(QLearningAgent.valid_actions(observation))
-                        )
-                    )
-                else:
-                    action = 0
-                observation, _, _, _ = environment.step(action)
-
-            returns[policy_name].append(environment.total_reward)
-
-    return returns

@@ -483,7 +483,6 @@ def render_simulation() -> None:
                 playback[
                     [
                         "step",
-                        "action (beds)",
                         "reward",
                         "penalty",
                         "final result",

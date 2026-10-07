@@ -12,7 +12,6 @@ from rl_model import (
     QLearningAgent,
     STANDARD_TASK,
     Task,
-    evaluate_policies,
 )
 
 
@@ -156,6 +155,27 @@ class HospitalEnvironmentTests(unittest.TestCase):
         _, _, _, second_info = environment.step(0)
         self.assertEqual(second_info["occupied_beds"], 0)
 
+    def test_bed_freed_during_step_is_available_for_next_action(self) -> None:
+        environment = HospitalEnvironment(seed=2)
+        environment.config = Task(
+            beds=2,
+            initial_patients=1,
+            max_steps=3,
+            arrival_rate=0.0,
+        )
+        environment.waiting = [Patient(id=2, severity="high")]
+        environment.occupied = [
+            Patient(id=1, severity="high", remaining_stay=1)
+        ]
+
+        next_observation, _, _, _ = environment.step(0)
+
+        self.assertEqual(next_observation["beds"], 2)
+        self.assertEqual(
+            list(QLearningAgent.valid_actions(next_observation)),
+            [0, 1],
+        )
+
     def test_discharged_beds_do_not_count_as_unavoidable_idle_beds(self) -> None:
         environment = HospitalEnvironment(seed=2)
         environment.config = Task(
@@ -226,7 +246,7 @@ class HospitalEnvironmentTests(unittest.TestCase):
 
         self.assertEqual(len(agent.training_metrics), 5)
         self.assertEqual(agent.training_metrics[-1]["episode"], 5)
-        self.assertEqual(agent.training_metrics[-1]["total_transitions"], 100)
+        self.assertEqual(agent.training_metrics[-1]["total_transitions"], 25)
         self.assertEqual(
             agent.training_metrics[-1]["learned_states"],
             len(agent.q_table),
@@ -295,32 +315,6 @@ class HospitalEnvironmentTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["final_result"], 1.2)
         self.assertAlmostEqual(updated_q, 0.18)
         self.assertAlmostEqual(td_error, 1.2)
-
-    def test_policy_evaluation_is_repeatable_and_returns_every_baseline(self) -> None:
-        agent = QLearningAgent(training_episodes=3, seed=21)
-        agent.train()
-
-        first = evaluate_policies(agent, episodes=4)
-        second = evaluate_policies(agent, episodes=4)
-
-        self.assertEqual(first, second)
-        self.assertEqual(
-            set(first),
-            {
-                "Q-learning (greedy)",
-                "Always admit maximum",
-                "Random valid action",
-                "Never admit",
-            },
-        )
-        self.assertTrue(
-            all(len(episode_returns) == 4 for episode_returns in first.values())
-        )
-
-    def test_policy_evaluation_requires_at_least_one_episode(self) -> None:
-        with self.assertRaisesRegex(ValueError, "episodes must be positive"):
-            evaluate_policies(QLearningAgent(training_episodes=1), episodes=0)
-
 
 class HospitalApiTests(unittest.TestCase):
     def setUp(self) -> None:

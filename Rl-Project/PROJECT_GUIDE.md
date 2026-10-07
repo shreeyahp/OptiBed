@@ -158,10 +158,6 @@ For terminal transitions, the target is just the immediate reward (there is no n
 
 The Q-table is held in process memory. The Streamlit app uses `st.cache_resource` to train/cache one shared agent for the running app process, so it is not retrained on every rerun. Training parameters are constructor options in Python, not dashboard settings. Training also records per-episode return and its trailing-100 mean and sample standard deviation, epsilon, observed exploration-decision rate, transition count, learned-state count, state-action value count, and mean tried actions per state. A copy of the Q-table is retained at the midpoint of training alongside the final table.
 
-The `evaluate_policies()` helper can run the greedy agent and three baselines
-for a paired comparison, but the dashboard does not display held-out policy
-evaluation.
-
 ## 7. Streamlit dashboard (`app.py`)
 
 ### Startup
