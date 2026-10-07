@@ -1,34 +1,46 @@
-# OptiBed
+# OptiBed — Hospital Bed Allocation Simulator
 
-OptiBed models bed allocation between Normal and COVID wards. Its Streamlit frontend lets you configure demand and discharge rates, inspect the learned transfer policy, and run a repeatable, step-by-step hospital simulation.
+OptiBed is a hospital bed-allocation simulator for Normal and COVID wards. It combines a finite-state policy optimizer with a Streamlit dashboard for exploring demand, bed transfers, and patient discharges.
 
-## Run the frontend
+## Quick start
 
-From the `OptiBed` project folder, install the dependencies and start the dashboard:
+Open PowerShell in the project folder (currently `Rl-Project`) and run:
 
 ```powershell
-cd "C:\Users\shreeya\Desktop\btech\sem7\lab\rl lab\hospital\OptiBed"
 python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
-Streamlit prints a local URL (usually `http://localhost:8501`) to open in your browser.
+Open the local URL printed by Streamlit, usually `http://localhost:8501`.
+
+To stop the dashboard, press `Ctrl+C` in the PowerShell window.
+
+## Using the dashboard
+
+1. Set the total number of beds and how many start in the Normal ward. Remaining beds are assigned to COVID.
+2. Adjust each ward's average daily requests and discharges, the future-reward discount, simulation length, and random seed.
+3. Select **Apply settings & reset** to calculate a policy for the new configuration.
+4. Use **Start / resume** to run automatically, **Pause** to stop, **Step one day** to advance manually, or **Reset run** to restart.
+5. Adjust **Time per simulated day** to control the animation pace. The default is 0.8 seconds per day.
+
+The dashboard displays ward occupancy, the policy's suggested transfer, expected reward, a policy heatmap, daily results, and an event log. A positive transfer means Normal → COVID; a negative transfer means COVID → Normal.
+
+## Model and reward
+
+The policy's state tracks each ward's bed capacity and currently available beds. Independent Poisson distributions model daily requests and discharges. Discharges are limited to the number of occupied beds.
+
+- Each unmet Normal request costs 10 reward points.
+- Each unmet COVID request costs 20 reward points.
+- Each transferred bed costs 5 reward points.
+
+The simulation uses the configured random seed, so the same settings and seed produce the same run. Total capacity is limited to 15 beds to keep policy optimization interactive.
+
+## Dependencies
+
+Dependencies are listed in `requirements.txt`: NumPy, SciPy, pandas, and Streamlit.
 
 Run the simulator tests with:
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
-
-## Dashboard features
-
-- Configure total beds, the initial ward split, per-ward Poisson arrival and discharge rates, the discount rate, simulation duration, and random seed.
-- Start/resume, pause, manually step, or reset the run.
-- Adjust the delay between simulated days (0.2–2.0 seconds).
-- Watch ward availability and occupancy, unmet requests, rewards, and transfers update as days progress.
-- Inspect the learned policy heatmap for the currently selected capacity split and the event log for each simulated day.
-- Compare the expected one-day reward with no transfer versus the current policy recommendation.
-
-The model uses available beds as the state. A positive transfer moves a free bed from Normal to COVID; a negative transfer moves one from COVID to Normal. Unmet Normal requests cost 10 reward points each, unmet COVID requests cost 20, and each transferred bed costs 5. Poisson arrivals/discharges are independent, and discharges cannot exceed the number of occupied beds in their ward.
-
-The simulation is stochastic but reproducible for a given seed. Total capacity is limited to 15 beds so the finite-state policy can be optimized interactively.
