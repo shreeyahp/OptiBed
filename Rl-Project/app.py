@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from rl_model import HospitalEnvironment, Observation, QLearningAgent
+from rl_model import (
+    DETERIORATION_PENALTY,
+    EMERGENCY_BONUS,
+    EMERGENCY_UNTREATED_PENALTY,
+    HIGH_UNTREATED_PENALTY,
+    HospitalEnvironment,
+    QLearningAgent,
+    TREATMENT_REWARD,
+    WASTED_BED_PENALTY,
+)
 
 
 PLAYBACK_INTERVAL_SECONDS = 1.8
@@ -21,7 +31,10 @@ st.markdown(
     [data-testid="stMetric"] {
         background: #fff; border: 1px solid #dbe7f5; border-radius: 12px;
         padding: 0.7rem 1rem; box-shadow: 0 2px 8px rgba(37, 99, 235, 0.04);
+        color: #24364b;
     }
+    [data-testid="stMetricLabel"] {color: #62758a;}
+    [data-testid="stMetricValue"] {color: #24364b;}
     .bed-grid {
         display: grid; grid-template-columns: repeat(4, minmax(92px, 1fr));
         gap: 12px; margin: 1rem 0;
@@ -74,24 +87,88 @@ def get_trained_agent() -> QLearningAgent:
     return agent
 
 
-with st.spinner("Training the Q-learning agent for this hospital environment..."):
-    agent = get_trained_agent()
+with st.spinner("Training the Q-learning agent..."):
+    trained_agent = get_trained_agent()
 
-if "environment" not in st.session_state:
-    st.session_state.environment = HospitalEnvironment()
-if "simulation_running" not in st.session_state:
-    st.session_state.simulation_running = False
-if "last_step_time" not in st.session_state:
-    st.session_state.last_step_time = 0.0
-if "last_step" not in st.session_state:
-    st.session_state.last_step = None
+
+def initialize_session_state() -> None:
+    if "agent" not in st.session_state:
+        st.session_state.agent = copy.deepcopy(trained_agent)
+    if "environment" not in st.session_state:
+        st.session_state.environment = HospitalEnvironment()
+    if "simulation_running" not in st.session_state:
+        st.session_state.simulation_running = False
+    if "last_step_time" not in st.session_state:
+        st.session_state.last_step_time = 0.0
+    if "last_step" not in st.session_state:
+        st.session_state.last_step = None
+
+
+initialize_session_state()
+agent: QLearningAgent = st.session_state.agent
 
 st.title("OptiBed")
 st.caption(
     "Watch a Q-learning agent make automatic bed-allocation decisions in a "
     "20-step hospital episode."
 )
-simulation_tab, graphs_tab = st.tabs(["Simulation", "Graphs"])
+simulation_tab, graphs_tab, training_tab = st.tabs(
+    ["Simulation", "Graphs", "Training"]
+)
+
+
+def q_table_dataframe(
+    q_table: dict[tuple[int, ...], dict[int, float]],
+) -> pd.DataFrame:
+    """Format every stored state/action value as one row per state."""
+    state_columns = [
+        "Beds available",
+        "High",
+        "Medium",
+        "Low",
+        "Emergencies",
+        "Steps remaining",
+    ]
+    actions = sorted(
+        {action for action_values in q_table.values() for action in action_values}
+    )
+    action_columns = {action: f"Q(a={action})" for action in actions}
+    rows = []
+    for state, action_values in sorted(q_table.items()):
+        row: dict[str, int | float] = dict(zip(state_columns, state))
+        row["Actions tried"] = len(action_values)
+        row.update({column: float("nan") for column in action_columns.values()})
+        row.update(
+            {
+                action_columns[action]: value
+                for action, value in action_values.items()
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def execution_dataframe(metrics: list[dict[str, object]]) -> pd.DataFrame:
+    playback = pd.DataFrame(metrics)
+    if playback.empty:
+        return playback
+    playback["reward_breakdown"] = playback["reward_components"].map(
+        lambda components: "; ".join(
+            f"{name.replace('_', ' ').title()} {amount:+.2f}"
+            for name, amount in components.items()
+            if amount
+        )
+        or "No reward or penalty"
+    )
+    return playback.drop(columns=["reward", "reward_components"]).rename(
+        columns={
+            "action": "action (beds)",
+            "gross_reward": "reward",
+            "penalty": "penalty",
+            "final_result": "final result",
+            "reward_breakdown": "reward / penalty details",
+        }
+    )
 
 
 def render_patient_cards(waiting: list[dict[str, Any]]) -> None:
@@ -116,11 +193,12 @@ def render_patient_cards(waiting: list[dict[str, Any]]) -> None:
             )
 
 
-def render_transition(observation: Observation, transition: dict[str, Any]) -> None:
+def render_transition(transition: dict[str, Any]) -> None:
+    agent: QLearningAgent = st.session_state.agent
     with st.container(border=True):
-        st.subheader(f"RL decision · step {observation['step']}")
         before = transition["observation"]
         after = transition["next_observation"]
+        st.subheader(f"RL decision · step {before['step']}")
         st.write(
             f"**State / observation** `sₜ` = "
             f"`{agent.state_key(before)}` "
@@ -129,12 +207,20 @@ def render_transition(observation: Observation, transition: dict[str, Any]) -> N
         st.write(
             f"**Action** `aₜ`: allocate **{transition['action']}** bed(s). "
             f"**Policy value** `Q(sₜ, aₜ)`: "
-            f"**{transition['q_value']:+.2f}**"
+            f"**{transition['q_value']:+.2f} → "
+            f"{transition['updated_q_value']:+.2f}** after online update "
+            f"(TD error {transition['td_error']:+.2f})"
         )
         reward, reward_components = transition["reward"], transition["info"][
             "reward_components"
         ]
-        st.write(f"**Reward** `rₜ`: **{reward:+.2f}**")
+        gross_reward = sum(max(amount, 0.0) for amount in reward_components.values())
+        penalty = -sum(min(amount, 0.0) for amount in reward_components.values())
+        st.write(
+            f"**Reward calculation:** {gross_reward:+.2f} reward "
+            f"− {penalty:.2f} penalty = **{reward:+.2f} final result** "
+            "(`rₜ`, used by Q-learning)"
+        )
         nonzero_rewards = {
             name.replace("_", " ").title(): amount
             for name, amount in reward_components.items()
@@ -180,6 +266,8 @@ def render_transition(observation: Observation, transition: dict[str, Any]) -> N
     run_every=0.2 if st.session_state.simulation_running else None
 )
 def render_simulation() -> None:
+    initialize_session_state()
+    agent: QLearningAgent = st.session_state.agent
     environment: HospitalEnvironment = st.session_state.environment
     state = environment.state()
     controls = st.columns([1, 1, 1, 3])
@@ -207,6 +295,8 @@ def render_simulation() -> None:
         key="reset_simulation",
     ):
         st.session_state.environment = HospitalEnvironment()
+        st.session_state.agent = copy.deepcopy(trained_agent)
+        agent = st.session_state.agent
         st.session_state.simulation_running = False
         st.session_state.last_step_time = 0.0
         st.session_state.last_step = None
@@ -224,10 +314,19 @@ def render_simulation() -> None:
             action = agent.choose_action(state)
             q_value = agent.q_value(state, action)
             next_state, reward, done, info = environment.step(action)
+            updated_q_value, td_error = agent.learn_from_transition(
+                state,
+                action,
+                reward,
+                next_state,
+                reward_components=info["reward_components"],
+            )
             st.session_state.last_step = {
                 "observation": state,
                 "action": action,
                 "q_value": q_value,
+                "updated_q_value": updated_q_value,
+                "td_error": td_error,
                 "next_observation": next_state,
                 "reward": reward,
                 "info": info,
@@ -293,11 +392,74 @@ def render_simulation() -> None:
             st.caption("Emergency patients and severity are identified on each card.")
             render_patient_cards(waiting)
         if st.session_state.last_step is not None:
-            render_transition(state, st.session_state.last_step)
+            render_transition(st.session_state.last_step)
         elif state["step"] == 0:
             st.info("Press Start to watch the trained agent make its first decision.")
         if state["done"]:
             st.success("Episode complete. Press Reset to run another episode.")
+
+    playback = execution_dataframe(agent.execution_metrics)
+    with st.container(border=True):
+        st.subheader("Reward by simulation step")
+        st.caption(
+            "Reward is shown before deductions; penalty is the positive amount "
+            "subtracted. Final result is the net reward used by Q-learning."
+        )
+        if playback.empty:
+            st.info("Step rewards and penalties will appear after the first action.")
+        else:
+            st.dataframe(
+                playback[
+                    [
+                        "step",
+                        "action (beds)",
+                        "reward",
+                        "penalty",
+                        "final result",
+                        "reward / penalty details",
+                    ]
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+
+    with st.container(border=True):
+        st.subheader("Reward mechanism")
+        st.caption(
+            "These fixed rewards and penalties are applied by the simulation "
+            "on each step. An untreated emergency patient also receives the "
+            "high-severity penalty."
+        )
+        reward_rules = pd.DataFrame(
+            [
+                {
+                    "Event": "Treat low / medium / high severity",
+                    "Reward": (
+                        f"{TREATMENT_REWARD['low']:+g} / "
+                        f"{TREATMENT_REWARD['medium']:+g} / "
+                        f"{TREATMENT_REWARD['high']:+g}"
+                    ),
+                },
+                {"Event": "Treat an emergency patient", "Reward": f"{EMERGENCY_BONUS:+g} bonus"},
+                {
+                    "Event": "Leave a high-severity patient untreated for a step",
+                    "Reward": f"{HIGH_UNTREATED_PENALTY:+g}",
+                },
+                {
+                    "Event": "Leave an emergency patient untreated for a step",
+                    "Reward": f"{EMERGENCY_UNTREATED_PENALTY:+g}",
+                },
+                {
+                    "Event": "Leave an available bed unused while people are waiting",
+                    "Reward": f"{WASTED_BED_PENALTY:+g} per bed",
+                },
+                {
+                    "Event": "Patient deterioration",
+                    "Reward": f"{DETERIORATION_PENALTY:+g} per severity level",
+                },
+            ]
+        )
+        st.dataframe(reward_rules, hide_index=True, width="stretch")
 
 
 @st.fragment(
@@ -324,7 +486,12 @@ def render_graphs() -> None:
                     "waiting_low": "Low severity",
                 }
             )
-            st.line_chart(queue_trend, color=["#ef5350", "#f5b82e", "#24b47e"])
+            st.line_chart(
+                queue_trend,
+                color=["#ef5350", "#f5b82e", "#24b47e"],
+                x_label="Simulation step",
+                y_label="Patients waiting",
+            )
     with bed_column:
         with st.container(border=True):
             st.subheader("Bed use")
@@ -332,6 +499,8 @@ def render_graphs() -> None:
             st.line_chart(
                 history[["occupied_beds", "available_beds"]],
                 color=["#3388ee", "#9aa9b9"],
+                x_label="Simulation step",
+                y_label="Number of beds",
             )
     with st.container(border=True):
         st.subheader("Reward over time")
@@ -339,8 +508,117 @@ def render_graphs() -> None:
         reward_trend = history[["reward", "cumulative_reward"]].rename(
             columns={"reward": "This step", "cumulative_reward": "Episode total"}
         )
-        st.line_chart(reward_trend, color=["#f5a623", "#17a673"])
+        st.line_chart(
+            reward_trend,
+            color=["#f5a623", "#17a673"],
+            x_label="Simulation step",
+            y_label="Reward",
+        )
         st.metric("Current episode grade", f"{environment.grade():.3f}")
+
+
+@st.fragment(run_every=0.5 if st.session_state.simulation_running else None)
+def render_training() -> None:
+    training = pd.DataFrame(agent.training_metrics)
+    latest = agent.training_metrics[-1]
+    st.subheader("Q-learning training")
+    st.caption(
+        "Training uses simulated episodes. The trained Q-table below is a "
+        "snapshot taken immediately after training; playback starts from a "
+        "separate per-session copy and updates that copy after every action."
+    )
+
+    metrics = st.columns(5)
+    metrics[0].metric("Episodes completed", f"{len(agent.episode_returns):,}")
+    metrics[1].metric("Environment transitions", f"{latest['total_transitions']:,}")
+    metrics[2].metric("Learned states", f"{latest['learned_states']:,}")
+    metrics[3].metric("State-action values", f"{latest['state_action_values']:,}")
+    metrics[4].metric(
+        "Actions tried / state",
+        f"{latest['mean_actions_per_state']:.2f}",
+    )
+
+    settings = st.columns(5)
+    settings[0].metric("Learning rate (α)", f"{agent.learning_rate:.2f}")
+    settings[1].metric("Discount factor (γ)", f"{agent.discount_factor:.2f}")
+    settings[2].metric("Initial ε", f"{training.iloc[0]['epsilon']:.3f}")
+    settings[3].metric("Final ε", f"{latest['epsilon']:.3f}")
+    settings[4].metric(
+        "Exploration in final episode",
+        f"{latest['exploration_rate']:.1%} "
+        f"({latest['exploration_decisions']} decisions)",
+    )
+    recent_metrics = training.iloc[-100:]
+    st.caption(
+        "Last 100 training episodes: mean return "
+        f"{recent_metrics['episode_return'].mean():+.2f}, "
+        f"sample standard deviation "
+        f"{recent_metrics['episode_return'].std(ddof=1):.2f}. "
+        f"Training seed: {agent.seed}."
+    )
+
+    trained_table = q_table_dataframe(agent.trained_q_table)
+    with st.expander(
+        f"Q-table after training · {len(trained_table):,} states "
+        f"· {latest['state_action_values']:,} state-action values"
+    ):
+        st.caption(
+            "This frozen snapshot was captured when training completed. Blank "
+            "cells mean that state/action pair was not tried during training."
+        )
+        st.dataframe(
+            trained_table.round(3), hide_index=True, width="stretch", height=420
+        )
+        st.download_button(
+            "Download trained Q-table as CSV",
+            trained_table.to_csv(index=False),
+            file_name="optibed_trained_q_table.csv",
+            mime="text/csv",
+            key="download_trained_q_table",
+        )
+
+    playback = pd.DataFrame(agent.execution_metrics)
+    if playback.empty:
+        st.info("Start the simulation to execute actions and update the Q-table.")
+    else:
+        playback_states = playback.drop_duplicates(subset=["state"])
+        st.subheader("After executing simulation steps")
+        playback_columns = st.columns(4)
+        playback_columns[0].metric("Executed steps", len(playback))
+        playback_columns[1].metric(
+            "States visited", len(playback_states)
+        )
+        playback_columns[2].metric(
+            "State-action values", sum(len(values) for values in agent.q_table.values())
+        )
+        playback_columns[3].metric(
+            "Last Q update",
+            f"{playback.iloc[-1]['q_before']:.3f} → "
+            f"{playback.iloc[-1]['q_after']:.3f}",
+        )
+        with st.expander("Executed step Q-learning updates"):
+            playback_table = execution_dataframe(agent.execution_metrics)
+            st.caption(
+                "Reward is shown before deductions; penalty is the amount "
+                "subtracted; final result is the net reward used by Q-learning."
+            )
+            st.dataframe(playback_table, hide_index=True, width="stretch")
+            st.download_button(
+                "Download executed-step updates as CSV",
+                playback_table.to_csv(index=False),
+                file_name="optibed_execution_updates.csv",
+                mime="text/csv",
+                key="download_execution_metrics",
+            )
+    with st.expander("Per-episode training metrics"):
+        st.dataframe(training, hide_index=True, width="stretch", height=420)
+        st.download_button(
+            "Download training metrics as CSV",
+            training.to_csv(index=False),
+            file_name="optibed_training_metrics.csv",
+            mime="text/csv",
+            key="download_training_metrics",
+        )
 
 
 with simulation_tab:
@@ -348,3 +626,6 @@ with simulation_tab:
 
 with graphs_tab:
     render_graphs()
+
+with training_tab:
+    render_training()

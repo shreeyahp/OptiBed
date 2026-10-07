@@ -9,7 +9,7 @@ python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
-The **Simulation** tab has **Start**, **Stop**, and **Reset** controls. Start automatically advances the episode at a slow pace (one step every 1.8 seconds); no manual allocation is required. The dashboard shows available beds as bed icons and waiting patients by severity. After every decision, it displays the observed state, chosen allocation, learned Q-value, reward breakdown, treated patients, next state, and new arrivals. The **Graphs** tab shows waiting patients by severity, beds in use versus available, and step/cumulative reward. Charts are kept out of the Simulation tab.
+The **Simulation** tab has **Start**, **Stop**, and **Reset** controls. Start automatically advances the episode at a slow pace (one step every 1.8 seconds); no manual allocation is required. The dashboard shows available beds as bed icons and waiting patients by severity. After every decision, it displays the observed state, chosen allocation, Q-value before and after its online update, reward breakdown, treated patients, next state, and new arrivals. A step-by-step reward table shows gross reward, penalty, and final net result for each action. The **Graphs** tab shows waiting patients by severity, beds in use versus available, and step/cumulative reward, each with a legend. The **Training** tab shows training metrics, a frozen post-training Q-table, and Q-learning updates from steps executed in the current simulation.
 
 The dashboard trains the agent once when the app starts (1,200 training episodes; subsequent page reruns reuse the trained agent). It uses epsilon-greedy exploration during training and the greedy learned policy during the displayed episode. Its compact state tracks available beds, waiting high/medium/low patient counts, emergency count, and steps remaining; each queue count is capped at 16 to keep the tabular state space bounded. The Q-learning update is:
 
@@ -18,6 +18,8 @@ Q(s, a) <- Q(s, a) + alpha * (r + gamma * max_a' Q(s', a') - Q(s, a))
 ```
 
 This is a small educational tabular agent, not a clinical decision-support system.
+
+For a detailed walkthrough of the architecture, simulation rules, Q-learning implementation, dashboard, API, and tests, see [PROJECT_GUIDE.md](PROJECT_GUIDE.md).
 
 Start the API separately if needed:
 

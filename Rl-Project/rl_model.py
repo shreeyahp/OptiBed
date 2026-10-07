@@ -17,7 +17,7 @@ SEVERITY_LEVEL: dict[Severity, int] = {"low": 0, "medium": 1, "high": 2}
 class Task:
     beds: int
     initial_patients: int
-    max_steps: int = 20
+    max_steps: int = 5
     arrival_rate: float = 1.0
 
 
@@ -138,6 +138,7 @@ class HospitalEnvironment:
                 "allocate cannot exceed available beds or the number of waiting patients."
             )
 
+        beds_available_before_discharges = self.beds_available
         self._advance_discharges()
         reward_components = {
             "treated": 0.0,
@@ -157,7 +158,7 @@ class HospitalEnvironment:
             self.occupied.append(patient)
 
         if self.waiting:
-            idle_beds = self.beds_available
+            idle_beds = max(0, beds_available_before_discharges - len(treated))
             wasted = min(idle_beds, len(self.waiting))
             reward_components["wasted_bed"] = WASTED_BED_PENALTY * wasted
 
@@ -298,7 +299,7 @@ class QLearningAgent:
 
     def __init__(
         self,
-        training_episodes: int = 1_200,
+        training_episodes: int = 600,
         learning_rate: float = 0.15,
         discount_factor: float = 0.95,
         seed: int = 2026,
@@ -317,6 +318,9 @@ class QLearningAgent:
             dict
         )
         self.episode_returns: list[float] = []
+        self.training_metrics: list[dict[str, float | int]] = []
+        self.trained_q_table: dict[tuple[int, ...], dict[int, float]] = {}
+        self.execution_metrics: list[dict[str, object]] = []
         self.trained = False
 
     @staticmethod
@@ -350,17 +354,76 @@ class QLearningAgent:
         action_values = self.q_table.get(state, {})
         return max(actions, key=lambda action: (action_values.get(action, 0.0), action))
 
+    def learn_from_transition(
+        self,
+        observation: Observation,
+        action: int,
+        reward: float,
+        next_observation: Observation,
+        reward_components: dict[str, float] | None = None,
+    ) -> tuple[float, float]:
+        """Apply one online Q-learning update and record the executed transition."""
+        if action not in self.valid_actions(observation):
+            raise ValueError("action must be valid for the supplied observation.")
+
+        components = reward_components or {}
+        positive_reward = sum(max(amount, 0.0) for amount in components.values())
+        penalty = -sum(min(amount, 0.0) for amount in components.values())
+        if not components:
+            positive_reward = max(reward, 0.0)
+            penalty = max(-reward, 0.0)
+
+        state = self.state_key(observation)
+        next_state = self.state_key(next_observation)
+        current_q = self.q_table[state].get(action, 0.0)
+        if next_observation["done"]:
+            target = reward
+        else:
+            next_actions = self.valid_actions(next_observation)
+            next_values = self.q_table.get(next_state, {})
+            target = reward + self.discount_factor * max(
+                next_values.get(next_action, 0.0)
+                for next_action in next_actions
+            )
+
+        td_error = target - current_q
+        updated_q = current_q + self.learning_rate * td_error
+        self.q_table[state][action] = updated_q
+        self.execution_metrics.append(
+            {
+                "step": observation["step"] + 1,
+                "state": state,
+                "action": action,
+                "reward": reward,
+                "gross_reward": positive_reward,
+                "penalty": penalty,
+                "final_result": reward,
+                "reward_components": components.copy(),
+                "q_before": current_q,
+                "q_after": updated_q,
+                "td_error": td_error,
+            }
+        )
+        return updated_q, td_error
+
     def train(self) -> None:
         self.q_table.clear()
         self.episode_returns.clear()
+        self.training_metrics.clear()
+        self.trained_q_table.clear()
+        self.execution_metrics.clear()
+        self.trained = False
         rng = np.random.default_rng(self.seed)
         alpha = self.learning_rate
         gamma = self.discount_factor
+        total_transitions = 0
 
         for episode in range(self.training_episodes):
             environment = HospitalEnvironment(seed=self.seed + episode)
             observation = environment.state()
             episode_return = 0.0
+            exploration_steps = 0
+            episode_steps = 0
             progress = episode / max(self.training_episodes - 1, 1)
             epsilon = max(0.03, 0.35 * (1.0 - progress))
 
@@ -369,6 +432,7 @@ class QLearningAgent:
                 actions = self.valid_actions(observation)
                 if rng.random() < epsilon:
                     action = int(rng.choice(list(actions)))
+                    exploration_steps += 1
                 else:
                     action = self.choose_action(observation)
 
@@ -388,8 +452,88 @@ class QLearningAgent:
                     target - current_q
                 )
                 episode_return += reward
+                episode_steps += 1
                 observation = next_observation
 
             self.episode_returns.append(episode_return)
+            total_transitions += episode_steps
+            recent_returns = self.episode_returns[-100:]
+            state_action_count = sum(len(values) for values in self.q_table.values())
+            self.training_metrics.append(
+                {
+                    "episode": episode + 1,
+                    "episode_return": episode_return,
+                    "rolling_mean_return": float(np.mean(recent_returns)),
+                    "rolling_std_return": (
+                        float(np.std(recent_returns, ddof=1))
+                        if len(recent_returns) > 1
+                        else 0.0
+                    ),
+                    "epsilon": epsilon,
+                    "exploration_rate": exploration_steps / episode_steps,
+                    "exploration_decisions": exploration_steps,
+                    "transitions": episode_steps,
+                    "total_transitions": total_transitions,
+                    "learned_states": len(self.q_table),
+                    "state_action_values": state_action_count,
+                    "mean_actions_per_state": (
+                        state_action_count / len(self.q_table)
+                        if self.q_table
+                        else 0.0
+                    ),
+                }
+            )
 
         self.trained = True
+        self.trained_q_table = {
+            state: values.copy() for state, values in self.q_table.items()
+        }
+
+
+def evaluate_policies(
+    agent: QLearningAgent,
+    episodes: int = 100,
+    seed: int | None = None,
+) -> dict[str, list[float]]:
+    """Evaluate the greedy policy and simple baselines on shared held-out seeds."""
+    if episodes < 1:
+        raise ValueError("episodes must be positive.")
+
+    first_seed = (
+        agent.seed + agent.training_episodes
+        if seed is None
+        else seed
+    )
+    policy_names = (
+        "Q-learning (greedy)",
+        "Always admit maximum",
+        "Random valid action",
+        "Never admit",
+    )
+    returns = {name: [] for name in policy_names}
+    random_action_rng = np.random.default_rng(first_seed + episodes)
+
+    for episode in range(episodes):
+        environment_seed = first_seed + episode
+        for policy_name in policy_names:
+            environment = HospitalEnvironment(seed=environment_seed)
+            observation = environment.state()
+
+            while not observation["done"]:
+                if policy_name == "Q-learning (greedy)":
+                    action = agent.choose_action(observation)
+                elif policy_name == "Always admit maximum":
+                    action = max(QLearningAgent.valid_actions(observation))
+                elif policy_name == "Random valid action":
+                    action = int(
+                        random_action_rng.choice(
+                            list(QLearningAgent.valid_actions(observation))
+                        )
+                    )
+                else:
+                    action = 0
+                observation, _, _, _ = environment.step(action)
+
+            returns[policy_name].append(environment.total_reward)
+
+    return returns

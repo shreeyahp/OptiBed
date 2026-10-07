@@ -12,6 +12,7 @@ from rl_model import (
     QLearningAgent,
     STANDARD_TASK,
     Task,
+    evaluate_policies,
 )
 
 
@@ -155,6 +156,27 @@ class HospitalEnvironmentTests(unittest.TestCase):
         _, _, _, second_info = environment.step(0)
         self.assertEqual(second_info["occupied_beds"], 0)
 
+    def test_discharged_beds_do_not_count_as_unavoidable_idle_beds(self) -> None:
+        environment = HospitalEnvironment(seed=2)
+        environment.config = Task(
+            beds=2,
+            initial_patients=2,
+            max_steps=2,
+            arrival_rate=0.0,
+        )
+        environment.waiting = [
+            Patient(id=2, severity="high"),
+            Patient(id=3, severity="medium"),
+        ]
+        environment.occupied = [
+            Patient(id=1, severity="high", remaining_stay=1)
+        ]
+
+        with patch("rl_model.EMERGENCY_ARRIVAL_PROBABILITY", 0.0):
+            _, _, _, info = environment.step(1)
+
+        self.assertEqual(info["reward_components"]["wasted_bed"], 0.0)
+
     def test_grade_is_bounded_and_increases_with_return(self) -> None:
         environment = HospitalEnvironment(seed=1)
         initial_grade = environment.grade()
@@ -197,6 +219,107 @@ class HospitalEnvironmentTests(unittest.TestCase):
 
         self.assertEqual(first.episode_returns, second.episode_returns)
         self.assertEqual(dict(first.q_table), dict(second.q_table))
+
+    def test_training_records_progress_metrics_and_frozen_trained_q_table(self) -> None:
+        agent = QLearningAgent(training_episodes=5, seed=31)
+        agent.train()
+
+        self.assertEqual(len(agent.training_metrics), 5)
+        self.assertEqual(agent.training_metrics[-1]["episode"], 5)
+        self.assertEqual(agent.training_metrics[-1]["total_transitions"], 100)
+        self.assertEqual(
+            agent.training_metrics[-1]["learned_states"],
+            len(agent.q_table),
+        )
+        self.assertEqual(
+            agent.training_metrics[-1]["state_action_values"],
+            sum(len(values) for values in agent.q_table.values()),
+        )
+        self.assertEqual(dict(agent.trained_q_table), dict(agent.q_table))
+        self.assertGreater(len(agent.trained_q_table), 0)
+
+    def test_execution_updates_q_values_without_changing_trained_snapshot(self) -> None:
+        agent = QLearningAgent(training_episodes=5, seed=31)
+        agent.train()
+        observation = HospitalEnvironment(seed=agent.seed).state()
+        state = agent.state_key(observation)
+        action = next(iter(agent.trained_q_table[state]))
+        trained_value = agent.trained_q_table[state][action]
+        next_observation = {**observation, "done": True}
+
+        updated_q, td_error = agent.learn_from_transition(
+            observation,
+            action,
+            100.0,
+            next_observation,
+        )
+
+        self.assertAlmostEqual(
+            updated_q,
+            trained_value + agent.learning_rate * (100.0 - trained_value),
+        )
+        self.assertNotEqual(updated_q, trained_value)
+        self.assertEqual(agent.trained_q_table[state][action], trained_value)
+        self.assertEqual(agent.q_table[state][action], updated_q)
+        self.assertEqual(len(agent.execution_metrics), 1)
+        self.assertEqual(agent.execution_metrics[0]["td_error"], td_error)
+
+    def test_execution_update_rejects_invalid_action(self) -> None:
+        agent = QLearningAgent(training_episodes=2, seed=12)
+        observation = HospitalEnvironment(seed=14).state()
+
+        with self.assertRaisesRegex(ValueError, "action must be valid"):
+            agent.learn_from_transition(
+                observation,
+                observation["beds"] + 1,
+                1.0,
+                observation,
+            )
+
+    def test_execution_metrics_separate_reward_penalty_and_net_result(self) -> None:
+        agent = QLearningAgent(training_episodes=1, seed=12)
+        observation = HospitalEnvironment(seed=14).state()
+        next_observation = {**observation, "done": True}
+
+        updated_q, td_error = agent.learn_from_transition(
+            observation,
+            0,
+            1.2,
+            next_observation,
+            reward_components={"treated": 1.5, "wasted_bed": -0.3},
+        )
+
+        metrics = agent.execution_metrics[0]
+        self.assertAlmostEqual(metrics["gross_reward"], 1.5)
+        self.assertAlmostEqual(metrics["penalty"], 0.3)
+        self.assertAlmostEqual(metrics["final_result"], 1.2)
+        self.assertAlmostEqual(updated_q, 0.18)
+        self.assertAlmostEqual(td_error, 1.2)
+
+    def test_policy_evaluation_is_repeatable_and_returns_every_baseline(self) -> None:
+        agent = QLearningAgent(training_episodes=3, seed=21)
+        agent.train()
+
+        first = evaluate_policies(agent, episodes=4)
+        second = evaluate_policies(agent, episodes=4)
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            set(first),
+            {
+                "Q-learning (greedy)",
+                "Always admit maximum",
+                "Random valid action",
+                "Never admit",
+            },
+        )
+        self.assertTrue(
+            all(len(episode_returns) == 4 for episode_returns in first.values())
+        )
+
+    def test_policy_evaluation_requires_at_least_one_episode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "episodes must be positive"):
+            evaluate_policies(QLearningAgent(training_episodes=1), episodes=0)
 
 
 class HospitalApiTests(unittest.TestCase):

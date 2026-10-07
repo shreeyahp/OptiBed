@@ -2,4 +2,5 @@ numpy
 streamlit
 pandas
 fastapi
+httpx2
 uvicorn
