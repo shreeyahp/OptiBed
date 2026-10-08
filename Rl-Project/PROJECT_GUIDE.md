@@ -17,8 +17,8 @@ The project is a compact Python application; it does not have a database, fronte
 
 | Path | Responsibility |
 |---|---|
-| `rl_model.py` | Domain types, episode configuration, hospital simulation, reward and history calculation, and the tabular Q-learning agent. This is the shared backend used by both interfaces. |
-| `app.py` | Streamlit dashboard, agent training/caching, simulation controls, patient and bed visualization, transition explanation, and charts. |
+| `rl_model.py` | Domain types, episode configuration, hospital simulation, reward/history calculation, and the tabular Q-learning agent. This is the shared backend used by both interfaces. |
+| `app.py` | Streamlit dashboard, agent training/caching, simulation controls, patient and bed visualization, transition explanation, charts, and training summaries. |
 | `api.py` | FastAPI application and HTTP routes for health, reset, state, stepping, and grade. |
 | `tests/test_environment.py` | Unit and HTTP-level tests for the environment rules, learning behavior, determinism, and API validation. |
 | `requirements.txt` | Runtime/test package names: NumPy, Streamlit, pandas, FastAPI, and Uvicorn. |
@@ -32,7 +32,7 @@ The repository does not include a separate package directory or project/build ma
 - **Python** is used for the simulation, learning algorithm, dashboard, API, and tests.
 - **NumPy** provides seeded random number generation, Poisson arrivals, random choices, and the grade calculation.
 - **Streamlit** renders the interactive dashboard and maintains browser-session UI state.
-- **pandas** converts the simulation history into chart-ready data.
+- **pandas** converts simulation history and training/execution metrics for dashboard tables and charts.
 - **FastAPI** defines the HTTP service and OpenAPI documentation.
 - **httpx2** provides the transport used by FastAPI's `TestClient` in the test suite.
 - **Pydantic** (used through FastAPI) validates API request bodies and query parameters.
@@ -77,15 +77,14 @@ Constructing `HospitalEnvironment(seed=...)` initializes a NumPy random generato
 
 `HospitalEnvironment.step(allocate)` receives the number of waiting patients to treat. The allocation must be an integer, cannot be negative, and cannot exceed either available beds or queue length. Invalid actions fail before the step counter advances. A completed episode rejects further steps until reset.
 
-After validation against the beds available at the start of the step, the implementation proceeds in this order:
+After validation against the beds available in the current observation, the implementation proceeds in this order:
 
-1. Record beds available before discharges, then advance stays for patients already occupying beds and discharge those whose remaining stay reaches zero.
-2. Select the requested number of patients from the waiting queue.
-3. Give each selected patient a randomly sampled stay of 1, 2, or 3 steps and move them into occupied beds.
-4. Add treatment rewards and the emergency treatment bonus for treated patients.
-5. Penalize waiting high-severity and emergency patients, penalize beds left idle while patients wait (counting only beds already free before discharges), and probabilistically worsen waiting patients who are not already high severity.
-6. Generate regular and emergency arrivals, except after the final decision of an episode.
-7. Advance the step counter, sum reward components, update cumulative reward and history, and return the next observation, reward, completion flag, and transition details.
+1. Select the requested number of patients from the waiting queue.
+2. Give each selected patient a randomly sampled stay of 1, 2, or 3 steps and move them into occupied beds.
+3. Add treatment rewards and the emergency treatment bonus for treated patients.
+4. Penalize waiting high-severity and emergency patients, penalize beds left idle while patients wait, and probabilistically worsen eligible waiting patients.
+5. Generate regular and emergency arrivals, except after the final decision of an episode.
+6. Advance the step counter and treatment stays, sum reward components, update cumulative reward and history, and return the next observation, reward, completion flag, and transition details. Beds freed here appear as available in the next observation, before the next action is selected.
 
 Treatment selection sorts the waiting queue by emergency status, then severity, then patient ID (earlier IDs win ties). Consequently, emergencies are preferred to non-emergencies, and within those groups high severity is preferred to medium and low.
 
@@ -148,7 +147,7 @@ Reset restores that session's copy from the frozen post-training Q-table.
 
 ### Update and defaults
 
-The defaults are 1,200 training episodes, learning rate (`alpha`) 0.15, discount factor (`gamma`) 0.95, and learner seed 2026. The standard one-step update is:
+The defaults are 600 training episodes, learning rate (`alpha`) 0.15, discount factor (`gamma`) 0.95, and learner seed 2026. The standard one-step update is:
 
 ```text
 Q(s, a) <- Q(s, a) + alpha * (r + gamma * max_a' Q(s', a') - Q(s, a))
@@ -156,7 +155,7 @@ Q(s, a) <- Q(s, a) + alpha * (r + gamma * max_a' Q(s', a') - Q(s, a))
 
 For terminal transitions, the target is just the immediate reward (there is no next-state value). Each training episode gets environment seed `agent_seed + episode`; a separate seeded generator controls exploration. This makes training repeatable for a fixed configuration and seed. `episode_returns` stores the sum of rewards for each training episode, and `q_table` maps state keys to action values.
 
-The Q-table is held in process memory. The Streamlit app uses `st.cache_resource` to train/cache one shared agent for the running app process, so it is not retrained on every rerun. Training parameters are constructor options in Python, not dashboard settings. Training also records per-episode return and its trailing-100 mean and sample standard deviation, epsilon, observed exploration-decision rate, transition count, learned-state count, state-action value count, and mean tried actions per state. A copy of the Q-table is retained at the midpoint of training alongside the final table.
+The Q-table is held in process memory. The Streamlit app uses `st.cache_resource` to train/cache one shared agent for the running app process, so it is not retrained on every rerun. Training parameters are constructor options in Python, not dashboard settings. Training records per-episode return and its trailing-100 mean and sample standard deviation, epsilon, observed exploration-decision rate, transition count, learned-state count, state-action value count, and mean tried actions per state. The Q-table is copied after training as a frozen reference; each playback session works on its own mutable copy.
 
 ## 7. Streamlit dashboard (`app.py`)
 
@@ -169,11 +168,7 @@ The app sets a wide page layout, defines CSS and a small inline bed SVG, then ge
 - `last_step_time`: timing reference for the playback interval;
 - `last_step`: data for the most recent transition explanation.
 
-The first app load includes model training (1,200 episodes by default). Streamlit reruns reuse the cached agent resource.
-
-An agent overview is displayed below the OptiBed title and episode description,
-including the algorithm, training episode count, trained-state count, recent
-training return, and playback interval.
+The first app load includes model training (600 episodes by default). Streamlit reruns reuse the cached agent resource. An agent overview shows the algorithm, episode count, learned states, recent average return, and playback interval.
 
 ### Simulation tab
 
@@ -189,8 +184,8 @@ The Simulation tab displays:
   patient;
 - spacious severity-colored user-icon patient cards; non-emergency cards omit a
   redundant waiting badge, and an empty queue uses a subdued empty state;
-- the most recent observation, selected allocation, Q-value, reward breakdown, treated patients, next observation, and arrivals.
-- a per-step table of allocation, gross reward, penalty, net result, and reward-component details.
+- the most recent observation, selected allocation, Q-value before/after online update, reward breakdown, treated patients, next observation, and arrivals;
+- a per-step reward table with gross reward, penalty, net result, and reward details.
 
 When running, a Streamlit fragment reruns frequently to keep the UI responsive, but a decision is made only after the 1.8-second playback interval has elapsed. Start enables automatic greedy actions; Stop pauses them; Reset makes a new environment and clears the displayed last transition.
 
@@ -211,11 +206,11 @@ count or reward quantity on the vertical axis; Streamlit's native series
 legends distinguish each line. Before the first step the tab shows a prompt
 instead of empty charts. The graph fragment refreshes while playback is running.
 
-The Training tab displays training metrics and hyperparameters, one frozen
-Q-table captured immediately after training, and the executed-step Q-learning
-updates with gross reward, penalty, and final net result. The post-execution
-Q-table and training charts are not displayed. The frozen table, training
-metrics, and execution updates can be downloaded as CSV.
+The Training tab displays summary training results and hyperparameters. Its
+per-episode table and CSV contain only episode, episode return, epsilon, and
+rolling mean return. The trained Q-table itself is not displayed. Executed-step
+Q-learning updates are shown separately with reward, penalty, and Q-value
+details; the execution table can be downloaded as CSV.
 
 ## 8. HTTP API (`api.py`)
 
@@ -260,7 +255,7 @@ python -m unittest discover -s tests -v
 
 ## 10. Test coverage and review notes
 
-`tests/test_environment.py` contains 14 tests covering:
+`tests/test_environment.py` covers:
 
 - standard scenario settings, repeatable reset, and history rows;
 - emergency/severity prioritization and reward breakdown;
@@ -272,15 +267,13 @@ python -m unittest discover -s tests -v
 - Q-learning training, valid actions, and fixed-seed reproducibility;
 - API health/reset/state/grade/step behavior and invalid request rejection.
 
-The suite was run while preparing this guide: **14 tests passed**.
-
 The following are useful constraints to keep in mind when extending or deploying the project:
 
 1. **This is a simplified simulator.** Arrival rates, deterioration, stays, and rewards are fixed assumptions in code; they do not represent validated real-world clinical rules.
 2. **The learner is intentionally compact.** Counts are capped, and patient identity/order and occupied-patient remaining stays are not features of the Q-state. This reduces the table but loses information about the true environment state.
 3. **API episodes are shared.** The module-global environment has no per-client isolation, persistence, authentication, or concurrency/session management.
 4. **Training is in-memory and app-startup work.** There is no saved model artifact or dedicated training command in the repository. A process restart requires training again.
-5. **Environment timing and allocation constraints are step-based.** A submitted allocation is validated against currently reported available beds before existing stays are advanced inside the transition. Clients should use the returned observation as the authority for their next action.
+5. **Environment timing and allocation constraints are step-based.** A submitted allocation is validated against the available beds in the current observation. Existing treatment stays advance at the end of the step, and beds freed then appear in the next observation.
 6. **Dashboard and API are separate entry points.** The dashboard uses the trained policy; the API accepts external decisions. Starting one does not make the other call into it.
 
 These are current design properties and scope limitations, not claims that the prototype is production-ready.

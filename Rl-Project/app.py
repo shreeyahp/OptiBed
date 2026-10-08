@@ -191,37 +191,6 @@ simulation_tab, graphs_tab, training_tab = st.tabs(
 )
 
 
-def q_table_dataframe(
-    q_table: dict[tuple[int, ...], dict[int, float]],
-) -> pd.DataFrame:
-    """Format every stored state/action value as one row per state."""
-    state_columns = [
-        "Beds available",
-        "High",
-        "Medium",
-        "Low",
-        "Emergencies",
-        "Steps remaining",
-    ]
-    actions = sorted(
-        {action for action_values in q_table.values() for action in action_values}
-    )
-    action_columns = {action: f"Q(a={action})" for action in actions}
-    rows = []
-    for state, action_values in sorted(q_table.items()):
-        row: dict[str, int | float] = dict(zip(state_columns, state))
-        row["Actions tried"] = len(action_values)
-        row.update({column: float("nan") for column in action_columns.values()})
-        row.update(
-            {
-                action_columns[action]: value
-                for action, value in action_values.items()
-            }
-        )
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
 def execution_dataframe(metrics: list[dict[str, object]]) -> pd.DataFrame:
     playback = pd.DataFrame(metrics)
     if playback.empty:
@@ -608,16 +577,11 @@ def render_training() -> None:
         f"{latest['mean_actions_per_state']:.2f}",
     )
 
-    settings = st.columns(5)
+    settings = st.columns(4)
     settings[0].metric("Learning rate (α)", f"{agent.learning_rate:.2f}")
     settings[1].metric("Discount factor (γ)", f"{agent.discount_factor:.2f}")
     settings[2].metric("Initial ε", f"{training.iloc[0]['epsilon']:.3f}")
     settings[3].metric("Final ε", f"{latest['epsilon']:.3f}")
-    settings[4].metric(
-        "Exploration in final episode",
-        f"{latest['exploration_rate']:.1%} "
-        f"({latest['exploration_decisions']} decisions)",
-    )
     recent_metrics = training.iloc[-100:]
     st.caption(
         "Last 100 training episodes: mean return "
@@ -626,26 +590,6 @@ def render_training() -> None:
         f"{recent_metrics['episode_return'].std(ddof=1):.2f}. "
         f"Training seed: {agent.seed}."
     )
-
-    trained_table = q_table_dataframe(agent.trained_q_table)
-    with st.expander(
-        f"Q-table after training · {len(trained_table):,} states "
-        f"· {latest['state_action_values']:,} state-action values"
-    ):
-        st.caption(
-            "This frozen snapshot was captured when training completed. Blank "
-            "cells mean that state/action pair was not tried during training."
-        )
-        st.dataframe(
-            trained_table.round(3), hide_index=True, width="stretch", height=420
-        )
-        st.download_button(
-            "Download trained Q-table as CSV",
-            trained_table.to_csv(index=False),
-            file_name="optibed_trained_q_table.csv",
-            mime="text/csv",
-            key="download_trained_q_table",
-        )
 
     playback = pd.DataFrame(agent.execution_metrics)
     if playback.empty:
@@ -681,10 +625,13 @@ def render_training() -> None:
                 key="download_execution_metrics",
             )
     with st.expander("Per-episode training metrics"):
-        st.dataframe(training, hide_index=True, width="stretch", height=420)
+        training_table = training[
+            ["episode", "episode_return", "epsilon", "rolling_mean_return"]
+        ]
+        st.dataframe(training_table, hide_index=True, width="stretch", height=420)
         st.download_button(
             "Download training metrics as CSV",
-            training.to_csv(index=False),
+            training_table.to_csv(index=False),
             file_name="optibed_training_metrics.csv",
             mime="text/csv",
             key="download_training_metrics",
