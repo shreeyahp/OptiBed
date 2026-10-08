@@ -9,7 +9,7 @@ python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
-The dashboard has **Simulation**, **Graphs**, and **Training** tabs. Simulation plays the learned policy; Training shows learning settings, episode summaries, and Q-learning updates. The agent trains for 600 episodes by default.
+The dashboard has **Simulation**, **Graphs**, and **Training** tabs. Simulation plays the learned policy; Training shows learning settings, episode summaries, the trained Q-table, and Q-learning updates. The agent trains for 600 episodes by default.
 
 ## Learning setup
 

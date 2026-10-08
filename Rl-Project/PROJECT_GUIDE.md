@@ -208,9 +208,12 @@ instead of empty charts. The graph fragment refreshes while playback is running.
 
 The Training tab displays summary training results and hyperparameters. Its
 per-episode table and CSV contain only episode, episode return, epsilon, and
-rolling mean return. The trained Q-table itself is not displayed. Executed-step
-Q-learning updates are shown separately with reward, penalty, and Q-value
-details; the execution table can be downloaded as CSV.
+rolling mean return. It also displays the trained Q-table with state columns,
+Q-value columns for treating zero through eight patients, and the best valid
+action for each state. The table is collapsible, includes a row-count index,
+and shuffles its display order. Blank Q-value cells mark actions that were not tried.
+Executed-step Q-learning updates are shown separately with reward, penalty,
+and Q-value details; the execution table can be downloaded as CSV.
 
 ## 8. HTTP API (`api.py`)
 

@@ -191,6 +191,41 @@ simulation_tab, graphs_tab, training_tab = st.tabs(
 )
 
 
+def q_table_dataframe(
+    q_table: dict[tuple[int, ...], dict[int, float]],
+) -> pd.DataFrame:
+    state_columns = [
+        "Available Beds",
+        "High-Severity Patients",
+        "Medium-Severity Patients",
+        "Low-Severity Patients",
+        "Emergency Patients",
+        "Steps Remaining",
+    ]
+    action_columns = {
+        action: f"Q-Value: Treat {action}" for action in range(9)
+    }
+    rows = []
+    for state, action_values in sorted(q_table.items()):
+        row: dict[str, int | float] = dict(zip(state_columns, state))
+        row.update(
+            {
+                column: action_values.get(action, float("nan"))
+                for action, column in action_columns.items()
+            }
+        )
+        max_action = min(state[0], sum(state[1:4]))
+        row["Best Action"] = max(
+            range(max_action + 1),
+            key=lambda action: (action_values.get(action, 0.0), action),
+        )
+        rows.append(row)
+    return pd.DataFrame(
+        rows,
+        columns=[*state_columns, *action_columns.values(), "Best Action"],
+    )
+
+
 def execution_dataframe(metrics: list[dict[str, object]]) -> pd.DataFrame:
     playback = pd.DataFrame(metrics)
     if playback.empty:
@@ -582,6 +617,26 @@ def render_training() -> None:
     settings[1].metric("Discount factor (γ)", f"{agent.discount_factor:.2f}")
     settings[2].metric("Initial ε", f"{training.iloc[0]['epsilon']:.3f}")
     settings[3].metric("Final ε", f"{latest['epsilon']:.3f}")
+
+    with st.expander("Q-table after training"):
+        st.caption(
+            "Rows are shuffled for display. Blank cells mean no value was "
+            "learned for that action (treated as 0 when choosing). Best Action "
+            "is the highest-valued valid action; ties favor the larger action."
+        )
+        trained_table = q_table_dataframe(
+            agent.trained_q_table
+        ).round(3).sample(frac=1).reset_index(drop=True)
+        trained_table.insert(0, "Index", range(1, len(trained_table) + 1))
+        st.dataframe(trained_table, hide_index=True, width="stretch", height=420)
+        st.download_button(
+            "Download trained Q-table as CSV",
+            trained_table.to_csv(index=False),
+            file_name="optibed_trained_q_table.csv",
+            mime="text/csv",
+            key="download_trained_q_table",
+        )
+
     playback = pd.DataFrame(agent.execution_metrics)
     if playback.empty:
         st.info("Start the simulation to execute actions and update the Q-table.")
