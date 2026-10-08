@@ -582,15 +582,6 @@ def render_training() -> None:
     settings[1].metric("Discount factor (γ)", f"{agent.discount_factor:.2f}")
     settings[2].metric("Initial ε", f"{training.iloc[0]['epsilon']:.3f}")
     settings[3].metric("Final ε", f"{latest['epsilon']:.3f}")
-    recent_metrics = training.iloc[-100:]
-    st.caption(
-        "Last 100 training episodes: mean return "
-        f"{recent_metrics['episode_return'].mean():+.2f}, "
-        f"sample standard deviation "
-        f"{recent_metrics['episode_return'].std(ddof=1):.2f}. "
-        f"Training seed: {agent.seed}."
-    )
-
     playback = pd.DataFrame(agent.execution_metrics)
     if playback.empty:
         st.info("Start the simulation to execute actions and update the Q-table.")
